@@ -1,0 +1,284 @@
+import gymnasium as gym
+import numpy as np
+import chess
+from collections import deque
+from random_agent import RAgent
+
+class ChessEnv(gym.Env):
+
+    def __init__(self, model=None, desired_color=chess.WHITE, record=False):
+        super().__init__()
+        self.BOARD_LAYERS = 12
+        EN_PASSANT_LAYERS = 1
+        CASTLES_LAYERS = 4
+        TURN_LAYERS = 1
+        self.LAST_POSITIONS = 8
+        self.META_LAYERS = EN_PASSANT_LAYERS + CASTLES_LAYERS + TURN_LAYERS
+        self.TOTAL_LAYERS = self.META_LAYERS + self.LAST_POSITIONS * self.BOARD_LAYERS
+        self.position_deque = deque(maxlen=self.LAST_POSITIONS)
+        self.record = record
+        self.recorded_positions = []
+
+        self.observation_space = gym.spaces.Box(
+            low=0.0, high=1.0, shape=(self.TOTAL_LAYERS, 8, 8), dtype=np.float32
+        )
+        self.action_space = gym.spaces.Discrete(4672)
+        self.board = chess.Board()
+
+        if model is None:
+            self.opponent = RAgent()
+        else:
+            self.opponent = model
+
+        self.opponent_color = chess.BLACK if desired_color == chess.WHITE else chess.BLACK
+
+    def reset(self, seed=None, options=None):
+        super().reset()
+        self.board.reset()
+        info = {}
+        if self.record:
+            self.recorded_positions.clear()
+        self.position_deque.clear()
+        self.position_deque.append(self._encode_pieces())
+
+        obs = self._encode_obs()
+
+        if self.opponent_color == chess.WHITE:
+            action = self.opponent(obs)
+            if isinstance(action, int):
+                action = self._decode_action(action)
+            self.board.push(action)
+            obs, _, __, ___, info = self.step(action)
+
+
+        return obs, info
+
+    def step(self, action):
+        # Ход нейросети
+        move = self._decode_action(action)
+
+        # нелегальный ход
+        if move not in self.board.legal_moves:
+            obs = self._encode_obs()
+            return obs, -10.0, True, False, {"illegal": True}
+
+        # применяем ход
+        self.board.push(move)
+        if self.record:
+            self.recorded_positions.append(self.board.uci(move))
+
+        # добавляем новую 12-слойную карту фигур в deque
+        new_base = self._encode_pieces()
+        self.position_deque.append(new_base)
+
+        if self.board.is_game_over():
+            obs = self._encode_obs()
+            outcome = self.board.outcome()
+            if outcome.winner is None:
+                reward = 0.0
+            else:
+                reward = 1.0
+            return obs, reward, True, False, {}
+
+        obs = self._encode_obs()
+
+        # Ход оппонента
+        action = self.opponent(obs)
+        if isinstance(action, int):
+            action = self._decode_action(action)
+        self.board.push(action)
+
+        if self.board.is_game_over():
+            obs = self._encode_obs()
+            outcome = self.board.outcome()
+            if outcome.winner is None:
+                reward = 0.0
+            else:
+                reward = -1.0
+            return obs, reward, True, False, {}
+
+        return obs, 0.0, False, False, {}
+
+    def _encode_pieces(self) -> np.ndarray:
+        planes = np.zeros((self.BOARD_LAYERS, 8, 8), dtype=np.float32)
+        piece_map = self.board.piece_map()
+        mapping = {
+            (chess.PAWN,   True): 0,
+            (chess.KNIGHT, True): 1,
+            (chess.BISHOP, True): 2,
+            (chess.ROOK,   True): 3,
+            (chess.QUEEN,  True): 4,
+            (chess.KING,   True): 5,
+            (chess.PAWN,   False): 6,
+            (chess.KNIGHT, False): 7,
+            (chess.BISHOP, False): 8,
+            (chess.ROOK,   False): 9,
+            (chess.QUEEN,  False): 10,
+            (chess.KING,   False): 11,
+        }
+
+        for square, piece in piece_map.items():
+            p = mapping[(piece.piece_type, piece.color)]
+            r = chess.square_rank(square)
+            c = chess.square_file(square)
+            planes[p, r, c] = 1.0
+        return planes
+
+    def _encode_obs(self):
+        obs = np.zeros((self.META_LAYERS + self.LAST_POSITIONS * self.BOARD_LAYERS, 8, 8), dtype=np.float32)
+
+        idx = 0
+
+        if self.board.turn == chess.WHITE:
+            obs[idx, :, :] = 1.0
+        idx += 1
+
+        # рокировки: WK, WQ, BK, BQ
+        obs[idx, :, :] = 1.0 if self.board.has_kingside_castling_rights(chess.WHITE) else 0.0
+        idx += 1
+        obs[idx, :, :] = 1.0 if self.board.has_queenside_castling_rights(chess.WHITE) else 0.0
+        idx += 1
+        obs[idx, :, :] = 1.0 if self.board.has_kingside_castling_rights(chess.BLACK) else 0.0
+        idx += 1
+        obs[idx, :, :] = 1.0 if self.board.has_queenside_castling_rights(chess.BLACK) else 0.0
+        idx += 1
+
+        # эн-пассант
+        if self.board.ep_square is not None:
+            r = chess.square_rank(self.board.ep_square)
+            c = chess.square_file(self.board.ep_square)
+            obs[idx, r, c] = 1.0
+        idx += 1
+
+        for b in self.position_deque:
+            obs[idx: idx + self.BOARD_LAYERS] = b
+            idx += self.BOARD_LAYERS
+
+        return obs
+
+    def _decode_action(self, action_id: int) -> chess.Move:
+        """
+        Декодируем индекс из [0, 4671] в ход python-chess (chess.Move).
+
+        Схема:
+        - 64 from-клетки * 73 плоскости.
+        - 0..55 : 8 направлений * 7 расстояний (слайдинги).
+        - 56..63: 8 ходов коня.
+        - 64..72: 9 underpromotion (N/B/R) для пешек.
+        """
+
+        if action_id < 0 or action_id >= 4672:
+            return chess.Move.null()
+
+        from_sq = action_id // 73              # 0..63
+        plane = action_id % 73                # 0..72
+
+        from_file = chess.square_file(from_sq)  # 0..7
+        from_rank = chess.square_rank(from_sq)  # 0..7
+
+        # ---------- 0..55: слайдинги ----------
+        if plane < 56:
+            dir_id = plane // 7               # 0..7
+            k = plane % 7 + 1                 # 1..7
+
+            # (df, dr): file, rank
+            directions = [
+                (1, 0),   # вправо
+                (-1, 0),  # влево
+                (0, 1),   # вверх
+                (0, -1),  # вниз
+                (1, 1),   # вверх-вправо
+                (-1, 1),  # вверх-влево
+                (1, -1),  # вниз-вправо
+                (-1, -1), # вниз-влево
+            ]
+            df, dr = directions[dir_id]
+            to_file = from_file + df * k
+            to_rank = from_rank + dr * k
+
+            # вышли за доску — считаем как null, потом отфильтруешь по legal_moves
+            if not (0 <= to_file <= 7 and 0 <= to_rank <= 7):
+                return chess.Move.null()
+
+            to_sq = chess.square(to_file, to_rank)
+
+            # особый случай: если это пешка, которая дошла до конца — авто-промо в ферзя
+            piece = self.board.piece_at(from_sq)
+            promotion = None
+            if piece is not None and piece.piece_type == chess.PAWN:
+                if piece.color == chess.WHITE and to_rank == 7:
+                    promotion = chess.QUEEN
+                elif piece.color == chess.BLACK and to_rank == 0:
+                    promotion = chess.QUEEN
+
+            return chess.Move(from_sq, to_sq, promotion=promotion)
+
+        # ---------- 56..63: конь ----------
+        if plane < 64:
+            knight_id = plane - 56
+            knight_moves = [
+                (1, 2), (2, 1),
+                (2, -1), (1, -2),
+                (-1, -2), (-2, -1),
+                (-2, 1), (-1, 2),
+            ]
+            df, dr = knight_moves[knight_id]
+            to_file = from_file + df
+            to_rank = from_rank + dr
+
+            if not (0 <= to_file <= 7 and 0 <= to_rank <= 7):
+                return chess.Move.null()
+
+            to_sq = chess.square(to_file, to_rank)
+            return chess.Move(from_sq, to_sq)
+
+        # ---------- 64..72: underpromotion N/B/R ----------
+        promo_id = plane - 64                 # 0..8
+        dir_id = promo_id // 3                # 0..2
+        piece_id = promo_id % 3               # 0..2
+
+        # под что промоутим (без ферзя: он покрыт "обычными" ходами выше)
+        promo_pieces = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
+        promo_piece = promo_pieces[piece_id]
+
+        # три направления для пешки
+        # для белых: вперёд, взятие влево, взятие вправо
+        # для чёрных: зеркально
+        if self.board.turn == chess.WHITE:
+            directions = [
+                (0, 1),   # вперёд
+                (-1, 1),  # взятие влево
+                (1, 1),   # взятие вправо
+            ]
+            final_rank = 7
+        else:
+            directions = [
+                (0, -1),
+                (1, -1),
+                (-1, -1),
+            ]
+            final_rank = 0
+
+        df, dr = directions[dir_id]
+        to_file = from_file + df
+        to_rank = from_rank + dr
+
+        if not (0 <= to_file <= 7 and 0 <= to_rank <= 7):
+            return chess.Move.null()
+
+        # underpromotion имеет смысл только с предпоследней горизонтали
+        piece = self.board.piece_at(from_sq)
+        if piece is None or piece.piece_type != chess.PAWN:
+            return chess.Move.null()
+
+        if self.board.turn == chess.WHITE and from_rank != 6:
+            return chess.Move.null()
+        if self.board.turn == chess.BLACK and from_rank != 1:
+            return chess.Move.null()
+
+        if to_rank != final_rank:
+            return chess.Move.null()
+
+        to_sq = chess.square(to_file, to_rank)
+        return chess.Move(from_sq, to_sq, promotion=promo_piece)
+
