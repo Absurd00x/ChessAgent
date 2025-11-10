@@ -4,29 +4,34 @@ import chess
 from collections import deque
 from random_agent import RAgent
 
+BOARD_LAYERS = 12
+EN_PASSANT_LAYERS = 1
+CASTLES_LAYERS = 4
+TURN_LAYERS = 1
+LAST_POSITIONS = 8
+META_LAYERS = EN_PASSANT_LAYERS + CASTLES_LAYERS + TURN_LAYERS
+TOTAL_LAYERS = META_LAYERS + LAST_POSITIONS * BOARD_LAYERS
+
+TOTAL_MOVES = 4672
+
+
 class ChessEnv(gym.Env):
 
     def __init__(self, model=None, desired_color=chess.WHITE, record=False):
         super().__init__()
-        self.BOARD_LAYERS = 12
-        EN_PASSANT_LAYERS = 1
-        CASTLES_LAYERS = 4
-        TURN_LAYERS = 1
-        self.LAST_POSITIONS = 8
-        self.META_LAYERS = EN_PASSANT_LAYERS + CASTLES_LAYERS + TURN_LAYERS
-        self.TOTAL_LAYERS = self.META_LAYERS + self.LAST_POSITIONS * self.BOARD_LAYERS
-        self.position_deque = deque(maxlen=self.LAST_POSITIONS)
+
+        self.position_deque = deque(maxlen=LAST_POSITIONS)
         self.record = record
         self.recorded_positions = []
 
         self.observation_space = gym.spaces.Box(
-            low=0.0, high=1.0, shape=(self.TOTAL_LAYERS, 8, 8), dtype=np.float32
+            low=0.0, high=1.0, shape=(TOTAL_LAYERS, 8, 8), dtype=np.float32
         )
-        self.action_space = gym.spaces.Discrete(4672)
+        self.action_space = gym.spaces.Discrete(TOTAL_MOVES)
         self.board = chess.Board()
 
         if model is None:
-            self.opponent = RAgent()
+            self.opponent = RAgent(self.board)
         else:
             self.opponent = model
 
@@ -100,7 +105,7 @@ class ChessEnv(gym.Env):
         return obs, 0.0, False, False, {}
 
     def _encode_pieces(self) -> np.ndarray:
-        planes = np.zeros((self.BOARD_LAYERS, 8, 8), dtype=np.float32)
+        planes = np.zeros((BOARD_LAYERS, 8, 8), dtype=np.float32)
         piece_map = self.board.piece_map()
         mapping = {
             (chess.PAWN,   True): 0,
@@ -125,7 +130,7 @@ class ChessEnv(gym.Env):
         return planes
 
     def _encode_obs(self):
-        obs = np.zeros((self.META_LAYERS + self.LAST_POSITIONS * self.BOARD_LAYERS, 8, 8), dtype=np.float32)
+        obs = np.zeros((TOTAL_LAYERS, 8, 8), dtype=np.float32)
 
         idx = 0
 
@@ -151,8 +156,8 @@ class ChessEnv(gym.Env):
         idx += 1
 
         for b in self.position_deque:
-            obs[idx: idx + self.BOARD_LAYERS] = b
-            idx += self.BOARD_LAYERS
+            obs[idx: idx + BOARD_LAYERS] = b
+            idx += BOARD_LAYERS
 
         return obs
 
@@ -167,7 +172,7 @@ class ChessEnv(gym.Env):
         - 64..72: 9 underpromotion (N/B/R) для пешек.
         """
 
-        if action_id < 0 or action_id >= 4672:
+        if action_id < 0 or action_id >= TOTAL_LAYERS:
             return chess.Move.null()
 
         from_sq = action_id // 73              # 0..63

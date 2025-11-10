@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import random
 
 from itertools import count
-from env import ChessEnv
+from env import TOTAL_LAYERS
 
 class RolloutBuffer:
     def __init__(self, obs_shape, n_workers, rollout_len, gamma, lam, device):
@@ -63,7 +63,8 @@ class RolloutBuffer:
 class PPO:
     def __init__(self,
                  PolicyModel,
-                 ValueModel):
+                 ValueModel,
+                 make_env_function):
         self.rollout_len = 256
         self.n_workers = 8
         self.gamma = 0.99
@@ -79,12 +80,14 @@ class PPO:
         self.batch_ratio = 0.25
         self.entropy_weight=1e-3
 
-        env = ChessEnv()
+        env = make_env_function()
         obs_shape = env.observation_space.shape
         nA = env.action_space.n
         env.close()
 
         self.device = "cuda:0"
+
+        self.model =
 
         self.actor = PolicyModel(obs_shape[0], nA)
         self.critic = ValueModel(obs_shape[0])
