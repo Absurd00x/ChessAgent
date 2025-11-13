@@ -1,3 +1,5 @@
+from random import choice
+
 import gymnasium as gym
 import numpy as np
 import chess
@@ -17,7 +19,7 @@ TOTAL_MOVES = 4672
 
 class ChessEnv(gym.Env):
 
-    def __init__(self, model=None, desired_color=chess.WHITE, record=False):
+    def __init__(self, model=None, desired_color=None, record=False):
         super().__init__()
 
         self.position_deque = deque(maxlen=LAST_POSITIONS)
@@ -35,7 +37,18 @@ class ChessEnv(gym.Env):
         else:
             self.opponent = model
 
-        self.opponent_color = chess.BLACK if desired_color == chess.WHITE else chess.BLACK
+        if desired_color is None:
+            desired_color = choice((chess.WHITE, chess.BLACK))
+        self.trainer_color = chess.BLACK if desired_color == chess.WHITE else chess.WHITE
+
+    def _mask_legal(self):
+        mask = np.zeros(TOTAL_MOVES, dtype=np.bool)
+        for move in self.board.legal_moves:
+            a = self._encode_action(move)
+            b = self._decode_action(a)
+            assert b == move
+            mask[a] = np.bool(True)
+        return mask
 
     def reset(self, seed=None, options=None):
         super().reset()
@@ -48,14 +61,14 @@ class ChessEnv(gym.Env):
 
         obs = self._encode_obs()
 
-        if self.opponent_color == chess.WHITE:
+        if self.trainer_color == chess.WHITE:
             action = self.opponent(obs)
             if isinstance(action, int):
                 action = self._decode_action(action)
             self.board.push(action)
-            obs, _, __, ___, info = self.step(action)
+            obs = self._encode_obs()
 
-
+        info["legal_mask"] = self._mask_legal()
         return obs, info
 
     def step(self, action):
@@ -65,12 +78,18 @@ class ChessEnv(gym.Env):
         # нелегальный ход
         if move not in self.board.legal_moves:
             obs = self._encode_obs()
-            return obs, -10.0, True, False, {"illegal": True}
+            return obs, -0.1, False, False, {"illegal": True}
 
         # применяем ход
+        if self.board.is_capture(move):
+            reward = 0.01
+        else:
+            reward = 0
         self.board.push(move)
+        # print(self.board)
+
         if self.record:
-            self.recorded_positions.append(self.board.uci(move))
+            self.recorded_positions.append(move.uci())
 
         # добавляем новую 12-слойную карту фигур в deque
         new_base = self._encode_pieces()
@@ -83,7 +102,7 @@ class ChessEnv(gym.Env):
                 reward = 0.0
             else:
                 reward = 1.0
-            return obs, reward, True, False, {}
+            return obs, reward, True, False, {"winner": True}
 
         obs = self._encode_obs()
 
@@ -100,9 +119,12 @@ class ChessEnv(gym.Env):
                 reward = 0.0
             else:
                 reward = -1.0
-            return obs, reward, True, False, {}
+            return obs, reward, True, False, {"winner": False}
 
-        return obs, 0.0, False, False, {}
+        info = {}
+        mask = self._mask_legal()
+        info["legal_mask"] = mask
+        return obs, reward, False, False, info
 
     def _encode_pieces(self) -> np.ndarray:
         planes = np.zeros((BOARD_LAYERS, 8, 8), dtype=np.float32)
@@ -172,7 +194,7 @@ class ChessEnv(gym.Env):
         - 64..72: 9 underpromotion (N/B/R) для пешек.
         """
 
-        if action_id < 0 or action_id >= TOTAL_LAYERS:
+        if action_id < 0 or action_id >= TOTAL_MOVES:
             return chess.Move.null()
 
         from_sq = action_id // 73              # 0..63
@@ -287,3 +309,128 @@ class ChessEnv(gym.Env):
         to_sq = chess.square(to_file, to_rank)
         return chess.Move(from_sq, to_sq, promotion=promo_piece)
 
+    def _encode_action(self, move: chess.Move) -> int:
+        """
+        Обратное преобразование chess.Move -> action_id в [0, TOTAL_MOVES).
+
+        Схема такая же, как в _decode_action:
+        - 0..55  : слайдинги (8 направлений * 7 расстояний)
+        - 56..63 : конь
+        - 64..72 : underpromotion (N/B/R) пешек
+        """
+
+        # null-ход кодировать не будем
+        if move is None or move == chess.Move.null():
+            return -1
+
+        from_sq = move.from_square
+        to_sq = move.to_square
+
+        if from_sq is None or to_sq is None:
+            return -1
+
+        from_file = chess.square_file(from_sq)
+        from_rank = chess.square_rank(from_sq)
+        to_file = chess.square_file(to_sq)
+        to_rank = chess.square_rank(to_sq)
+
+        df = to_file - from_file
+        dr = to_rank - from_rank
+
+        # ---------- 1) Underpromotion N/B/R (плоскости 64..72) ----------
+        if move.promotion in (chess.KNIGHT, chess.BISHOP, chess.ROOK):
+            promo_pieces = [chess.KNIGHT, chess.BISHOP, chess.ROOK]
+
+            # направления должны совпадать с _decode_action
+            if self.board.turn == chess.WHITE:
+                directions = [
+                    (0, 1),  # вперёд
+                    (-1, 1),  # взятие влево
+                    (1, 1),  # взятие вправо
+                ]
+                final_rank = 7
+                start_rank = 6
+            else:
+                directions = [
+                    (0, -1),
+                    (1, -1),
+                    (-1, -1),
+                ]
+                final_rank = 0
+                start_rank = 1
+
+            # базовая валидация, как в _decode_action
+            if chess.square_rank(from_sq) != start_rank or chess.square_rank(to_sq) != final_rank:
+                return -1
+
+            step = (df, dr)
+            if step not in directions:
+                return -1
+
+            dir_id = directions.index(step)
+            piece_id = promo_pieces.index(move.promotion)
+
+            promo_id = dir_id * 3 + piece_id  # 0..8
+            plane = 64 + promo_id  # 64..72
+
+            action_id = from_sq * 73 + plane
+            return action_id if 0 <= action_id < TOTAL_MOVES else -1
+
+        # ---------- 2) Конь (плоскости 56..63) ----------
+        knight_moves = [
+            (1, 2), (2, 1),
+            (2, -1), (1, -2),
+            (-1, -2), (-2, -1),
+            (-2, 1), (-1, 2),
+        ]
+
+        step = (df, dr)
+        if step in knight_moves:
+            knight_id = knight_moves.index(step)  # 0..7
+            plane = 56 + knight_id  # 56..63
+            action_id = from_sq * 73 + plane
+            return action_id if 0 <= action_id < TOTAL_MOVES else -1
+
+        # ---------- 3) Слайдинги (плоскости 0..55) ----------
+        # те же directions, что в _decode_action
+        directions = [
+            (1, 0),  # вправо
+            (-1, 0),  # влево
+            (0, 1),  # вверх
+            (0, -1),  # вниз
+            (1, 1),  # вверх-вправо
+            (-1, 1),  # вверх-влево
+            (1, -1),  # вниз-вправо
+            (-1, -1),  # вниз-влево
+        ]
+
+        # проверяем, что ход действительно "линейный"
+        if df == 0 and dr == 0:
+            return -1
+
+        # шаг по направлению
+        def sign(x: int) -> int:
+            return (x > 0) - (x < 0)
+
+        step = (sign(df), sign(dr))
+
+        if step not in directions:
+            # не слайдинг (и не конь, и не underpromotion) — не кодируем
+            return -1
+
+        # расстояние
+        k_file = abs(df) if df != 0 else 0
+        k_rank = abs(dr) if dr != 0 else 0
+        k = max(k_file, k_rank)
+
+        if k < 1 or k > 7:
+            return -1
+
+        dir_id = directions.index(step)  # 0..7
+        plane = dir_id * 7 + (k - 1)  # 0..55
+
+        action_id = from_sq * 73 + plane
+        return action_id if 0 <= action_id < TOTAL_MOVES else -1
+
+def make_env_function(model=None, desired_color=None, record=False):
+    return ChessEnv(model=model, desired_color=desired_color, record=record)

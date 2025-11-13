@@ -71,8 +71,9 @@ class CNNActorCritic(nn.Module):
         values = self.critic(feat).squeeze(-1)
         return logits, values
 
-    def full_pass(self, x):
+    def full_pass(self, x, legal_mask):
         logits, values = self.forward(x)
+        logits[~legal_mask] = -1e9
         dist = D.Categorical(logits=logits)
         actions = dist.sample()
         logp = dist.log_prob(actions)
@@ -84,4 +85,14 @@ class CNNActorCritic(nn.Module):
         logits = self.actor(feat)
         return logits.argmax(dim=-1)
 
+    def values_only(self, x):
+        feat = self._features(x)
+        values = self.critic(feat).squeeze(-1)
+        return values
+
+    # Тут не используется маска легальных ходов!!!
+    def logits_only(self, x):
+        feat = self._features(x)
+        logits = self.actor(feat)
+        return logits
 
