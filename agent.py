@@ -187,6 +187,7 @@ class PPO:
             if episode // 100 != last_episode_shown:
                 print(f"Episodes: {episode}")
                 last_episode_shown = episode // 100
+                print(f"Winrate: {wins / total * 100:.4f}%")
             if episode - last_evaluation >= self.eval_interval:
                 self._evaluate(self.eval_games)
                 last_evaluation = episode
@@ -219,6 +220,8 @@ class PPO:
                 # Если эпизод закончился, то ресетим эту среду
                 for i, d in enumerate(dones):
                     if d:
+                        if infos["winner"][i] is True:
+                            wins += 1
                         total += 1
                         episode += 1
                         obs_i, info_i = venv.envs[i].reset()

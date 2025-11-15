@@ -102,7 +102,9 @@ class ChessEnv(gym.Env):
 
     def step(self, action):
         # Ход нейросети
+        start_material = self._material_for_current()
         move = self._decode_action(action)
+        finish_material = self._material_for_current()
         info = {}
         info["winner"] = None
 
@@ -115,7 +117,7 @@ class ChessEnv(gym.Env):
         info["legal_move"] = True
 
         # применяем ход
-        reward = 0.01 * self._material_for_current()
+        reward = 0.01 * finish_material - start_material
         if self.board.is_capture(move):
             self.my_captures += 1
         self.board.push(move)

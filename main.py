@@ -14,8 +14,8 @@ def make_env_function():
 os.makedirs("checkpoints", exist_ok=True)
 agent = PPO(make_env_function)
 
-my_path = "./checkpoints/second.pth"
-opponent_path = "./checkpoints/first.pth"
+my_path = "./checkpoints/third.pth"
+opponent_path = "./checkpoints/second.pth"
 
 if os.path.exists(my_path):
     data = load(my_path, map_location="cpu")
