@@ -5,10 +5,12 @@ import numpy as np
 import tqdm
 import matplotlib.pyplot as plt
 import random
+import torch.distributions as D
 
 from itertools import count
 from nw import CNNActorCritic
-from env import make_env_function
+from env import TOTAL_MOVES
+
 
 class RolloutBuffer:
     def __init__(self, obs_shape, n_workers, rollout_len, gamma, lam, device):
@@ -27,15 +29,17 @@ class RolloutBuffer:
         self.dones = torch.zeros((self.T, self.n_workers), dtype=torch.float32, device=self.device)
         self.logpas = torch.zeros((self.T, self.n_workers), dtype=torch.float32, device=self.device)
         self.values = torch.zeros((self.T, self.n_workers), dtype=torch.float32, device=self.device)
+        self.legal_masks = torch.zeros((self.T, self.n_workers, TOTAL_MOVES), dtype=torch.bool, device=self.device)
         self.ptr = 0
 
-    def add(self, s, a, r, d, logp, v):
+    def add(self, s, a, r, d, logp, v, legal_mask):
         self.states[self.ptr].copy_(s)
         self.actions[self.ptr].copy_(a)
         self.rewards[self.ptr].copy_(r)
         self.dones[self.ptr].copy_(d)
         self.logpas[self.ptr].copy_(logp)
         self.values[self.ptr].copy_(v)
+        self.legal_masks[self.ptr].copy_(legal_mask)
         self.ptr += 1
 
     @torch.no_grad()
@@ -46,7 +50,11 @@ class RolloutBuffer:
         last_gae = torch.zeros(N, dtype=torch.float32, device=self.device)
         for t in reversed(range(T)):
             done = self.dones[t]
-            next_value = (1.0 - done) * last_vaules if t == T-1 else self.values[t + 1]
+            if t == T - 1:
+                next_value = last_vaules
+            else:
+                next_value = self.values[t + 1]
+            next_value = (1.0 - done) * next_value
             delta = self.rewards[t] + self.gamma * next_value - self.values[t]
             last_gae = delta + self.gamma * self.lam * (1.0 - done) * last_gae
             adv[t] = last_gae
@@ -58,17 +66,19 @@ class RolloutBuffer:
         logpas = self.logpas.reshape(T * N)
         adv = adv.reshape(T * N)
         ret = ret.reshape(T * N)
-        return states, actions, logpas, adv, ret
+        legal_masks = self.legal_masks.reshape(T * N, TOTAL_MOVES)
+        return states, actions, logpas, adv, ret, legal_masks
 
 
 class PPO:
-    def __init__(self):
+    def __init__(self, make_env_function):
+        self.make_env_function = make_env_function
         self.rollout_len = 256
         self.n_workers = 8
         self.gamma = 0.99
         self.lam = 0.95
 
-        self.lr = 3e-4
+        self.lr = 1e-4
         # self.policy_coef = 1.0
         self.value_coef = 0.5
         self.entropy_coef = 1e-3
@@ -78,6 +88,9 @@ class PPO:
 
         self.epochs = 4
         self.batch_ratio = 0.25
+
+        self.eval_games = 300        # сколько партий в evaluate
+        self.eval_interval = 3000    # раз в сколько эпизодов вызывать evaluate
 
         env = make_env_function()
         obs_shape = env.observation_space.shape
@@ -100,7 +113,56 @@ class PPO:
             x = x.unsqueeze(0)
         return x
 
-    def train(self, desired_winrate = 60, seed=42, plot=False):
+    @torch.no_grad()
+    def _evaluate(self, evaluate_episodes=300):
+        venv = gym.vector.SyncVectorEnv([self.make_env_function for _ in range(self.n_workers)])
+        cur_obs, infos = venv.reset()
+
+        episodes = evaluate_episodes
+        finished_episodes = 0
+        pbar = tqdm.trange(episodes, desc="evaluating...")
+        wins = 0
+        illegal = 0
+        captures = 0
+
+        while finished_episodes < episodes:
+            obs = torch.as_tensor(cur_obs, dtype=torch.float32, device=self.device)
+            legal_mask = torch.as_tensor(infos["legal_mask"], device=self.device, dtype=torch.bool)
+
+            actions = self.model.make_move(obs, legal_mask)
+            actions = actions.cpu().numpy()
+
+            next_obs, rewards, terms, truncs, infos = venv.step(actions)
+            dones = np.logical_or(terms, truncs)
+            done_this_time = 0
+
+            for i, d in enumerate(dones):
+                illegal += (not infos["legal_move"][i])
+                if d:
+                    done_this_time += 1
+                    captures += venv.envs[i].my_captures
+
+                    if infos["winner"][i] is True:
+                        wins += 1
+
+                    obs_i, info_i = venv.envs[i].reset()
+                    next_obs[i] = obs_i
+                    infos["legal_mask"][i] = info_i["legal_mask"]
+            cur_obs = next_obs
+
+            pbar.update(done_this_time)
+            finished_episodes += done_this_time
+
+        venv.close()
+
+
+        winrate = wins / finished_episodes * 100 if finished_episodes > 0 else 0.0
+        print(f"[EVAL] Games: {finished_episodes}")
+        print(f"[EVAL] Winrate (greedy): {winrate:.8f}%")
+        print(f"[EVAL] illegal: {illegal}")
+        print(f"[EVAL] captures: {captures}")
+
+    def train(self, desired_winrate = 80, seed=42, plot=False):
         self.model.to(self.device)
         opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
@@ -108,7 +170,7 @@ class PPO:
         np.random.seed(seed)
         random.seed(seed)
 
-        venv = gym.vector.SyncVectorEnv([make_env_function for _ in range(self.n_workers)])
+        venv = gym.vector.SyncVectorEnv([self.make_env_function for _ in range(self.n_workers)])
         cur_obs, infos = venv.reset(seed=seed)
         episode = 1
 
@@ -117,24 +179,29 @@ class PPO:
 
         scores = []
 
-        last = 0
-        illegal = 0
+        last_episode_shown = 0
+        last_evaluation = 0
 
         print("Started training")
         while total < 500 or (total > 0 and wins / total * 100 < desired_winrate):
-            if episode // 100 != last:
+            if episode // 100 != last_episode_shown:
                 print(f"Episodes: {episode}")
-                print(f"Winrate: {wins/total * 100:.8f}%")
-                print(f"illegal: {illegal}")
-                illegal = 0
-                last = episode // 100
+                last_episode_shown = episode // 100
+            if episode - last_evaluation >= self.eval_interval:
+                self._evaluate(self.eval_games)
+                last_evaluation = episode
             # Collect rollout
             self.buffer.reset()
             for t in range(self.rollout_len):
                 obs = torch.as_tensor(cur_obs, dtype=torch.float32, device=self.device)
                 legal_mask = torch.as_tensor(infos["legal_mask"], device=self.device, dtype=torch.bool)
                 with torch.no_grad():
-                    actions, logpas, _, values = self.model.full_pass(obs, legal_mask)
+                    logits, values = self.model(obs)
+                    logits[~legal_mask] = -1e9
+                    dist = D.Categorical(logits=logits)
+                    actions = dist.sample()
+                    logpas = dist.log_prob(actions)
+
                 actions_np = actions.cpu().numpy()
                 next_obs, rewards, terms, truncs, infos = venv.step(actions_np)
                 dones = np.logical_or(terms, truncs).astype(np.float32)
@@ -145,29 +212,23 @@ class PPO:
                     torch.as_tensor(rewards, dtype=torch.float32, device=self.device),
                     torch.as_tensor(dones, dtype=torch.float32, device=self.device),
                     logpas,
-                    values
+                    values,
+                    legal_mask
                 )
 
                 # Если эпизод закончился, то ресетим эту среду
                 for i, d in enumerate(dones):
-                    illegal += (rewards[i] == -0.1)
                     if d:
-                        if rewards[i] > 0:
-                            wins += 1
-                            if plot:
-                                scores.append(1.0)
-                        else:
-                            scores.append(0.0)
                         total += 1
                         episode += 1
-
                         obs_i, info_i = venv.envs[i].reset()
                         next_obs[i] = obs_i
+                        infos["legal_mask"][i] = info_i["legal_mask"]
                 cur_obs = next_obs
             last_obs = torch.as_tensor(cur_obs, dtype=torch.float32, device=self.device)
             with torch.no_grad():
                 last_values = self.model.values_only(last_obs)
-            states, actions, old_logpas, adv, ret = self.buffer.compute_returns_adv(last_values)
+            states, actions, old_logpas, adv, ret, legal_masks = self.buffer.compute_returns_adv(last_values)
             # optimize
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
             n = states.size(0)
@@ -186,8 +247,10 @@ class PPO:
                     adv_b = adv[mb_idx]
                     old_lp_b = old_logpas[mb_idx]
                     ret_b = ret[mb_idx]
+                    lm_b = legal_masks[mb_idx]
 
                     logits, values = self.model(s_b)
+                    logits[~lm_b] = -1e9
                     dist = torch.distributions.Categorical(logits=logits)
                     new_logp = dist.log_prob(a_b)
                     entropy = dist.entropy().mean()

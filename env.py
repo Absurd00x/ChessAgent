@@ -16,6 +16,14 @@ TOTAL_LAYERS = META_LAYERS + LAST_POSITIONS * BOARD_LAYERS
 
 TOTAL_MOVES = 4672
 
+PIECE_VALUES = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+        chess.KING: 0,  # короля обычно не считаем в материале
+}
 
 class ChessEnv(gym.Env):
 
@@ -40,19 +48,38 @@ class ChessEnv(gym.Env):
         if desired_color is None:
             desired_color = choice((chess.WHITE, chess.BLACK))
         self.trainer_color = chess.BLACK if desired_color == chess.WHITE else chess.WHITE
+        self.my_captures = 0
+        self.moves = 0
 
     def _mask_legal(self):
-        mask = np.zeros(TOTAL_MOVES, dtype=np.bool)
+        mask = np.zeros(TOTAL_MOVES, dtype=bool)
         for move in self.board.legal_moves:
             a = self._encode_action(move)
             b = self._decode_action(a)
             assert b == move
-            mask[a] = np.bool(True)
+            mask[a] = True
         return mask
+
+    def _material(self, color):
+        res = 0
+        for piece in self.board.piece_map().values():
+            if piece.color == color:
+                res += PIECE_VALUES[piece.piece_type]
+        return res
+
+    def _material_for_current(self):
+        white = self._material(chess.WHITE)
+        black = self._material(chess.BLACK)
+        if self.trainer_color == chess.BLACK:
+            return white - black
+        else:
+            return black - white
 
     def reset(self, seed=None, options=None):
         super().reset()
         self.board.reset()
+        self.my_captures = 0
+        self.moves = 0
         info = {}
         if self.record:
             self.recorded_positions.clear()
@@ -62,30 +89,37 @@ class ChessEnv(gym.Env):
         obs = self._encode_obs()
 
         if self.trainer_color == chess.WHITE:
-            action = self.opponent(obs)
+            action = self.opponent.make_move(obs, self._mask_legal())
             if isinstance(action, int):
                 action = self._decode_action(action)
             self.board.push(action)
             obs = self._encode_obs()
 
+        info["winner"] = None
         info["legal_mask"] = self._mask_legal()
+        info["legal_move"] = True
         return obs, info
 
     def step(self, action):
         # Ход нейросети
         move = self._decode_action(action)
+        info = {}
+        info["winner"] = None
 
         # нелегальный ход
         if move not in self.board.legal_moves:
             obs = self._encode_obs()
-            return obs, -0.1, False, False, {"illegal": True}
+            info["legal_mask"] = self._mask_legal()
+            info["legal_move"] = False
+            return obs, -0.1, False, False, info
+        info["legal_move"] = True
 
         # применяем ход
+        reward = 0.01 * self._material_for_current()
         if self.board.is_capture(move):
-            reward = 0.01
-        else:
-            reward = 0
+            self.my_captures += 1
         self.board.push(move)
+        self.moves += 1
         # print(self.board)
 
         if self.record:
@@ -101,13 +135,15 @@ class ChessEnv(gym.Env):
             if outcome.winner is None:
                 reward = 0.0
             else:
-                reward = 1.0
-            return obs, reward, True, False, {"winner": True}
+                reward = 100.0
+            info["winner"] = True
+            info["legal_mask"] = self._mask_legal()
+            return obs, reward, True, False, info
 
         obs = self._encode_obs()
 
         # Ход оппонента
-        action = self.opponent(obs)
+        action = self.opponent.make_move(obs, self._mask_legal())
         if isinstance(action, int):
             action = self._decode_action(action)
         self.board.push(action)
@@ -118,13 +154,16 @@ class ChessEnv(gym.Env):
             if outcome.winner is None:
                 reward = 0.0
             else:
-                reward = -1.0
-            return obs, reward, True, False, {"winner": False}
+                reward = -100.0
+            info["winner"] = False
+            info["legal_mask"] = self._mask_legal()
+            return obs, reward, True, False, info
 
-        info = {}
-        mask = self._mask_legal()
-        info["legal_mask"] = mask
-        return obs, reward, False, False, info
+        info["legal_mask"] = self._mask_legal()
+        truncated = False
+        if self.moves > 256:
+            truncated = True
+        return obs, reward, False, truncated, info
 
     def _encode_pieces(self) -> np.ndarray:
         planes = np.zeros((BOARD_LAYERS, 8, 8), dtype=np.float32)
@@ -410,7 +449,7 @@ class ChessEnv(gym.Env):
 
         # шаг по направлению
         def sign(x: int) -> int:
-            return (x > 0) - (x < 0)
+            return int(x > 0) - int(x < 0)
 
         step = (sign(df), sign(dr))
 
@@ -432,5 +471,3 @@ class ChessEnv(gym.Env):
         action_id = from_sq * 73 + plane
         return action_id if 0 <= action_id < TOTAL_MOVES else -1
 
-def make_env_function(model=None, desired_color=None, record=False):
-    return ChessEnv(model=model, desired_color=desired_color, record=record)

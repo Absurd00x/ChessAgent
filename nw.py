@@ -1,7 +1,9 @@
 import torch.distributions as D
 import torch.nn as nn
+import torch
 
 from env import TOTAL_LAYERS, TOTAL_MOVES
+
 
 
 # Convolution Neural Network
@@ -9,10 +11,10 @@ class CNNActorCritic(nn.Module):
     def __init__(self,
                  in_channels=TOTAL_LAYERS,
                  n_actions=TOTAL_MOVES,
-                 conv_channels=(64, 64),
-                 shared_hidden=(256,256),
-                 actor_hidden=(128, 64),
-                 critic_hidden=(128, 64),
+                 conv_channels=(256, 256),
+                 shared_hidden=(512,),
+                 actor_hidden=(256, 256),
+                 critic_hidden=(256, 256),
                  convolution_activation_function=nn.ReLU,
                  fully_connected_activation_function=nn.ReLU,
                  actor_activation_function=nn.ReLU,
@@ -71,15 +73,6 @@ class CNNActorCritic(nn.Module):
         values = self.critic(feat).squeeze(-1)
         return logits, values
 
-    def full_pass(self, x, legal_mask):
-        logits, values = self.forward(x)
-        logits[~legal_mask] = -1e9
-        dist = D.Categorical(logits=logits)
-        actions = dist.sample()
-        logp = dist.log_prob(actions)
-        entropy = dist.entropy()
-        return actions, logp, entropy, values
-
     def greedy_action(self, x):
         feat = self._features(x)
         logits = self.actor(feat)
@@ -96,3 +89,39 @@ class CNNActorCritic(nn.Module):
         logits = self.actor(feat)
         return logits
 
+    # Это жадный ход, который используется,
+    # когда нейросеть является оппонентом
+    @torch.no_grad()
+    def make_move(self, x, legal_mask):
+        device = next(self.parameters()).device
+
+        single_obs = False
+
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x, dtype=torch.float32, device=device)
+        else:
+            x = x.to(device)
+
+        if x.dim() == 3:
+            # (C, H, W) -> (1, C, H, W)
+            single_obs = True
+            x = x.unsqueeze(0)
+
+        logits = self.logits_only(x)
+
+        if not isinstance(legal_mask, torch.Tensor):
+            legal_mask = torch.as_tensor(legal_mask, dtype=torch.bool, device=device)
+        else:
+            legal_mask = legal_mask.to(device)
+
+        if legal_mask.dim() == 1:
+            # (A) -> (1, A)
+            legal_mask = legal_mask.unsqueeze(0)
+
+        logits[~legal_mask] = -1e9
+        actions = logits.argmax(dim=-1)
+
+        if single_obs:
+            return int(actions.item())
+
+        return actions
