@@ -4,6 +4,7 @@ from env import ChessEnv
 from nw import CNNActorCritic
 import os
 
+#windows kek
 opponent = CNNActorCritic()
 
 def make_env_function():
