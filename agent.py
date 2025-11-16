@@ -1,316 +1,387 @@
-import gymnasium as gym
-
-import torch
-import numpy as np
-import tqdm
-import matplotlib.pyplot as plt
+import math
 import random
-import torch.distributions as D
-
-from itertools import count
+import numpy as np
+from env import board_to_planes, board_to_obs, action_id_to_move, move_to_id
+import chess
+import torch
+import torch.nn.functional as F
 from nw import CNNActorCritic
-from env import TOTAL_MOVES
+from collections import deque
+from constants import LAST_POSITIONS, TOTAL_MOVES, PIECE_VALUES
+
+position_deque = deque(maxlen=LAST_POSITIONS)
+
+def policy_to_pi_vector(board: chess.Board, policy:dict) -> np.ndarray:
+    """
+    Преобразуем policy в виде {chess.Move: prob} в вектор длины TOTAL_MOVES.
+    """
+
+    pi = np.zeros(TOTAL_MOVES, dtype=np.float32)
+    for move, prob in policy.items():
+        action_id = move_to_id(board, move)
+        assert 0 <= action_id < TOTAL_MOVES, "encode_action вернул некорректный id"
+        pi[action_id] = prob
+    return pi
 
 
-class RolloutBuffer:
-    def __init__(self, obs_shape, n_workers, rollout_len, gamma, lam, device):
-        self.obs_shape = obs_shape
-        self.n_workers = n_workers
-        self.T = rollout_len
-        self.gamma = gamma
-        self.lam = lam
+def self_play_game(model: CNNActorCritic,
+                   num_simulations=64,
+                   max_moves=200,
+                   device="cpu"):
+    """
+    Играем партию MCTS vs MCTS.
+    Возвращаем список (obs, pi_vec, z) для каждого хода.
+      obs   : np.ndarray [TOTAL_LAYERS, 8, 8]
+      pi_vec: np.ndarray [TOTAL_MOVES]
+      z     : скаляр в {-1, 0, +1} с точки зрения игрока, который делал ход.
+    """
+    mcts = MCTS(number_of_simulations=num_simulations,
+                model=model,
+                device=device)
+    board = chess.Board()
+    position_deque.clear()
+
+    trajectory = []
+    moves_cnt = 0
+
+    while not board.is_game_over() and moves_cnt < max_moves:
+        player = board.turn
+        obs = board_to_obs(board, position_deque)
+        move, policy = mcts.run(board)
+        pi_vec = policy_to_pi_vector(board, policy)
+
+        trajectory.append((obs, pi_vec, player))
+        board.push(move)
+        position_deque.append(board_to_planes(board))
+        moves_cnt += 1
+
+    outcome = board.outcome()
+    if outcome is None or outcome.winner is None:
+        z_white = 0.0
+    else:
+        z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
+
+    data = []
+    for obs, pi_vec, player in trajectory:
+        z = z_white if player == chess.WHITE else -z_white
+        data.append((obs, pi_vec, z))
+
+    return data
+
+
+def train_one_iteration(model: CNNActorCritic,
+                        optimizer: torch.optim.Optimizer,
+                        num_simulations=64,
+                        max_moves=200,
+                        device="cpu"):
+
+    data = self_play_game(model=model,
+                          num_simulations=num_simulations,
+                          max_moves=max_moves,
+                          device=device)
+    assert data is not None, "Не поступило данных для обучения в train_one_iteration()"
+
+    obs_list, pi_list, z_list = zip(*data)
+
+    obs_batch = np.stack(obs_list, axis=0)
+    pi_batch = np.stack(pi_list, axis=0)
+    z_batch = np.array(z_list, dtype=np.float32)
+
+    obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
+    pi_t = torch.as_tensor(pi_batch, dtype=torch.float32, device=device)
+    z_t = torch.as_tensor(z_batch, dtype=torch.float32, device=device)
+
+    logits, v_pred = model(obs_t)
+
+    value_loss = F.mse_loss(v_pred, z_t)
+
+    log_probs = torch.log_softmax(logits, dim=-1)
+    policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
+
+    loss = value_loss + policy_loss
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    return {
+        "loss": float(loss.item()),
+        "value_loss": float(value_loss.item()),
+        "policy_loss": float(policy_loss.item()),
+        "num_positions": len(data),
+    }
+
+
+class Node:
+    def __init__(self, prior: float, player_to_move: bool):
+        # Вероятность, что меня, а не другого ребёнка выберет родитель
+        self.prior_probability = float(prior)
+        # Сколько раз меня выбирали за всё время
+        self.number_of_visits = 0
+        # Оценка моего состояния
+        self.value = 0.0
+        # value / number_of_visits
+        self.mean_value = 0.0
+        self.children = {}
+        # 1 = white, 0 = black
+        self.player_to_move = player_to_move
+
+
+class MCTS:
+    def __init__(self,
+                 number_of_simulations: int = 100,
+                 c_puct: float = 1.5,
+                 model: CNNActorCritic | None = None,
+                 device: str = "cpu"):
+        self.number_of_simulations = number_of_simulations
+        # constant predictor upper confidence bound applied to trees
+        # коэффициент исследования в формуле PUCT
+        # Т.е. насколько сильно мы хотим исследовать
+        # Чем больше константа, тем больше исследуем
+        self.c_puct = c_puct
+
+        self.model = model
         self.device = device
-        self.reset()
+        if self.model is not None:
+            self.model.to(self.device)
+            self.model.eval()
 
-    def reset(self):
-        self.states = torch.zeros((self.T, self.n_workers, *self.obs_shape), dtype=torch.float32, device=self.device)
-        self.actions = torch.zeros((self.T, self.n_workers), dtype=torch.long, device=self.device)
-        self.rewards = torch.zeros((self.T, self.n_workers), dtype=torch.float32, device=self.device)
-        self.dones = torch.zeros((self.T, self.n_workers), dtype=torch.float32, device=self.device)
-        self.logpas = torch.zeros((self.T, self.n_workers), dtype=torch.float32, device=self.device)
-        self.values = torch.zeros((self.T, self.n_workers), dtype=torch.float32, device=self.device)
-        self.legal_masks = torch.zeros((self.T, self.n_workers, TOTAL_MOVES), dtype=torch.bool, device=self.device)
-        self.ptr = 0
+    def _ucb_score(self, parent: Node, child: Node):
+        # Если ещё никогда не были в вершине, то и оценки
+        # у этой вершины нет
+        if child.number_of_visits == 0:
+            q = 0.0
+        else:
+            q = child.mean_value
 
-    def add(self, s, a, r, d, logp, v, legal_mask):
-        self.states[self.ptr].copy_(s)
-        self.actions[self.ptr].copy_(a)
-        self.rewards[self.ptr].copy_(r)
-        self.dones[self.ptr].copy_(d)
-        self.logpas[self.ptr].copy_(logp)
-        self.values[self.ptr].copy_(v)
-        self.legal_masks[self.ptr].copy_(legal_mask)
-        self.ptr += 1
+        _eps = 1e-8
+        u = (self.c_puct
+             * child.prior_probability
+             * math.sqrt(parent.number_of_visits + _eps)
+             / (1.0 + child.number_of_visits))
+        return q + u
 
-    @torch.no_grad()
-    def compute_returns_adv(self, last_vaules):
-        # GAE по (T, N)
-        T, N = self.T, self.n_workers
-        adv = torch.zeros((T, N), dtype=torch.float32, device=self.device)
-        last_gae = torch.zeros(N, dtype=torch.float32, device=self.device)
-        for t in reversed(range(T)):
-            done = self.dones[t]
-            if t == T - 1:
-                next_value = last_vaules
-            else:
-                next_value = self.values[t + 1]
-            next_value = (1.0 - done) * next_value
-            delta = self.rewards[t] + self.gamma * next_value - self.values[t]
-            last_gae = delta + self.gamma * self.lam * (1.0 - done) * last_gae
-            adv[t] = last_gae
-        ret = adv + self.values
+    def run(self, root_state):
+        """
+        Главный метод:
+        - root_state — это будет chess.Board, но пока мы делаем абстрактно.
+        - Вернёт лучшую action и, возможно, распределение по действиям.
+        """
+        root = Node(prior=1.0, player_to_move=self._player_to_move(root_state))
 
-        # Выпрямляем
-        states = self.states.reshape(T * N, *self.obs_shape)
-        actions = self.actions.reshape(T * N)
-        logpas = self.logpas.reshape(T * N)
-        adv = adv.reshape(T * N)
-        ret = ret.reshape(T * N)
-        legal_masks = self.legal_masks.reshape(T * N, TOTAL_MOVES)
-        return states, actions, logpas, adv, ret, legal_masks
+        for _ in range(self.number_of_simulations):
+            self._simulate(root_state, root)
 
+        best_action = self._select_action_from_root(root)
+        policy = self._policy_from_root(root)
+        return best_action, policy
 
-class PPO:
-    def __init__(self, make_env_function):
-        self.make_env_function = make_env_function
-        self.rollout_len = 256
-        self.n_workers = 8
-        self.gamma = 0.99
-        self.lam = 0.95
+    def _player_to_move(self, state:chess.Board):
+        """
+        True = white, False = black (совпадает с chess.WHITE / chess.BLACK).
+        """
+        return state.turn
 
-        self.lr = 1e-4
-        # self.policy_coef = 1.0
-        self.value_coef = 0.5
-        self.entropy_coef = 1e-3
-        # суть PPO
-        self.policy_clip = 0.2
-        self.value_clip = 0.2
+    def _simulate(self, state: chess.Board, root_node: Node):
+        """
+        Одна MCTS-симуляция.
+        state: текущее состояние доски
+        root_node: соответствующий узел в дереве
+        - идти вниз по дереву (Selection),
+        - возможно расширять (Expansion),
+        - оценивать (Rollout/Evaluation),
+        - поднимать value вверх (Backup).
+        """
+        board = state.copy()
 
-        self.epochs = 4
-        self.batch_ratio = 0.25
+        path = [root_node]
+        node = root_node
 
-        self.eval_games = 300        # сколько партий в evaluate
-        self.eval_interval = 3000    # раз в сколько эпизодов вызывать evaluate
+        # Selection
+        while True:
+            if self._is_terminal(board):
+                break
+            if not node.children:
+                break
 
-        env = make_env_function()
-        obs_shape = env.observation_space.shape
-        env.close()
+            best_score = float("-inf")
+            best_move = None
+            best_child = None
 
-        self.device = "cuda:0"
+            for move, child in node.children.items():
+                score = self._ucb_score(node, child)
+                if score > best_score:
+                    best_score = score
+                    best_move = move
+                    best_child = child
 
-        self.model = CNNActorCritic()
+            assert best_child is not None, "MCTS: best_child is None, дерево в неконсистентном состоянии"
 
-        self.buffer = RolloutBuffer(obs_shape,
-                                    self.n_workers,
-                                    self.rollout_len,
-                                    self.gamma,
-                                    self.lam,
-                                    self.device)
+            board.push(best_move)
+            node = best_child
+            path.append(node)
 
-    def _state_to_device(self, state):
-        x = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        return x
+        # Теперь board / node - лист (или терминальная позиция)
 
-    @torch.no_grad()
-    def _evaluate(self, evaluate_episodes=300):
-        venv = gym.vector.SyncVectorEnv([self.make_env_function for _ in range(self.n_workers)])
-        cur_obs, infos = venv.reset()
+        # Expansion + evaluation
 
-        episodes = evaluate_episodes
-        finished_episodes = 0
-        pbar = tqdm.trange(episodes, desc="evaluating...")
-        wins = 0
-        illegal = 0
-        captures = 0
+        if self._is_terminal(board):
+            value = self._evaluate_terminal(board, root_node.player_to_move)
+        else:
+            legal_moves = self._get_legal_moves(board)
+            assert legal_moves, "MCTS: нет легальных ходов в нетерминальной позиции"
+            assert self.model is not None, "MCTS: модель не передали, получил None"
 
-        while finished_episodes < episodes:
-            obs = torch.as_tensor(cur_obs, dtype=torch.float32, device=self.device)
-            legal_mask = torch.as_tensor(infos["legal_mask"], device=self.device, dtype=torch.bool)
+            obs = board_to_obs(board, position_deque)
+            obs_t = torch.as_tensor(obs, dtype=torch.float32,
+                                    device=self.device).unsqueeze(0)
 
-            actions = self.model.make_move(obs, legal_mask)
-            actions = actions.cpu().numpy()
-
-            next_obs, rewards, terms, truncs, infos = venv.step(actions)
-            dones = np.logical_or(terms, truncs)
-            done_this_time = 0
-
-            for i, d in enumerate(dones):
-                illegal += (not infos["legal_move"][i])
-                if d:
-                    done_this_time += 1
-                    captures += venv.envs[i].my_captures
-
-                    if infos["winner"][i] is True:
-                        wins += 1
-
-                    obs_i, info_i = venv.envs[i].reset()
-                    next_obs[i] = obs_i
-                    infos["legal_mask"][i] = info_i["legal_mask"]
-            cur_obs = next_obs
-
-            pbar.update(done_this_time)
-            finished_episodes += done_this_time
-
-        venv.close()
-
-
-        winrate = wins / finished_episodes * 100 if finished_episodes > 0 else 0.0
-        print(f"[EVAL] Games: {finished_episodes}")
-        print(f"[EVAL] Winrate (greedy): {winrate:.8f}%")
-        print(f"[EVAL] illegal: {illegal}")
-        print(f"[EVAL] captures: {captures}")
-
-    def train(self, desired_winrate = 80, seed=42, plot=False):
-        self.model.to(self.device)
-        opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-
-        venv = gym.vector.SyncVectorEnv([self.make_env_function for _ in range(self.n_workers)])
-        cur_obs, infos = venv.reset(seed=seed)
-        episode = 1
-
-        wins = 0
-        total = 0
-
-        scores = []
-
-        last_episode_shown = 0
-        last_evaluation = 0
-
-        print("Started training")
-        while total < 500 or (total > 0 and wins / total * 100 < desired_winrate):
-            if episode // 100 != last_episode_shown:
-                print(f"Episodes: {episode}")
-                last_episode_shown = episode // 100
-                print(f"Winrate: {wins / total * 100:.4f}%")
-            if episode - last_evaluation >= self.eval_interval:
-                self._evaluate(self.eval_games)
-                last_evaluation = episode
-            # Collect rollout
-            self.buffer.reset()
-            for t in range(self.rollout_len):
-                obs = torch.as_tensor(cur_obs, dtype=torch.float32, device=self.device)
-                legal_mask = torch.as_tensor(infos["legal_mask"], device=self.device, dtype=torch.bool)
-                with torch.no_grad():
-                    logits, values = self.model(obs)
-                    logits[~legal_mask] = -1e9
-                    dist = D.Categorical(logits=logits)
-                    actions = dist.sample()
-                    logpas = dist.log_prob(actions)
-
-                actions_np = actions.cpu().numpy()
-                next_obs, rewards, terms, truncs, infos = venv.step(actions_np)
-                dones = np.logical_or(terms, truncs).astype(np.float32)
-
-                self.buffer.add(
-                    obs,
-                    actions,
-                    torch.as_tensor(rewards, dtype=torch.float32, device=self.device),
-                    torch.as_tensor(dones, dtype=torch.float32, device=self.device),
-                    logpas,
-                    values,
-                    legal_mask
-                )
-
-                # Если эпизод закончился, то ресетим эту среду
-                for i, d in enumerate(dones):
-                    if d:
-                        if infos["winner"][i] is True:
-                            wins += 1
-                        total += 1
-                        episode += 1
-                        obs_i, info_i = venv.envs[i].reset()
-                        next_obs[i] = obs_i
-                        infos["legal_mask"][i] = info_i["legal_mask"]
-                cur_obs = next_obs
-            last_obs = torch.as_tensor(cur_obs, dtype=torch.float32, device=self.device)
             with torch.no_grad():
-                last_values = self.model.values_only(last_obs)
-            states, actions, old_logpas, adv, ret, legal_masks = self.buffer.compute_returns_adv(last_values)
-            # optimize
-            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-            n = states.size(0)
-            batch_size = max(1, int(self.batch_ratio * n))
+                logits, v_pred = self.model(obs_t)
+                v = float(v_pred.item())
+                probs = torch.softmax(logits, dim=-1).cpu().numpy().reshape(-1)
 
-            # policy update
-            for _ in range(self.epochs):
-                idx = torch.randperm(n, device=self.device)
-                for start in range(0, n, batch_size):
-                    end = start + batch_size
-                    mb_idx = idx[start:end]
+            if board.turn != root_node.player_to_move:
+                v = -v
 
-                    # state batch = states[minibatch index]
-                    s_b = states[mb_idx]
-                    a_b = actions[mb_idx]
-                    adv_b = adv[mb_idx]
-                    old_lp_b = old_logpas[mb_idx]
-                    ret_b = ret[mb_idx]
-                    lm_b = legal_masks[mb_idx]
+            priors = {}
+            total_p = 0.0
 
-                    logits, values = self.model(s_b)
-                    logits[~lm_b] = -1e9
-                    dist = torch.distributions.Categorical(logits=logits)
-                    new_logp = dist.log_prob(a_b)
-                    entropy = dist.entropy().mean()
+            for move in legal_moves:
+                action_id = move_to_id(board, move)
+                assert 0 <= action_id < TOTAL_MOVES, "move_to_id вернул некорректный id"
+                p = float(probs[action_id])
+                priors[move] = p
+                total_p += p
 
-                    # policy loss
-                    ratio = (new_logp - old_lp_b).exp()
-                    surr1 = ratio * adv_b
-                    surr2 = torch.clamp(ratio,
-                                        1.0 - self.policy_clip,
-                                        1.0 + self.policy_clip) * adv_b
-                    policy_loss = -torch.min(surr1, surr2).mean()
+            for move in legal_moves:
+                child = Node(prior=priors[move],
+                             player_to_move=(not node.player_to_move))
+                node.children[move] = child
 
-                    values = values.squeeze(-1)
-                    v_old = values.detach()
-                    v_clipped = v_old + (values - v_old).clamp(-self.value_clip, self.value_clip)
-                    v_loss1 = (values - ret_b).pow(2)
-                    v_loss2 = (v_clipped - ret_b).pow(2)
-                    value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+            value = v
 
-                    # entropy regularization
-                    entropy_loss = -entropy
+        # backup: поднимаемся по пути вверх
+        for node in path:
+            node.number_of_visits += 1
+            node.value += value
+            node.mean_value = node.value / node.number_of_visits
 
-                    # общий loss
-                    loss = (policy_loss
-                            + self.value_coef * value_loss
-                            + self.entropy_coef * entropy_loss)
+    def _select_action_from_root(self, root: Node):
+        """
+        Выбираем ход с максимальным числом посещений.
+        Пока считаем, что root.children уже заполнены.
+        """
+        if not root.children:
+            return None # Если нет детей, то нет ходов
 
-                    opt.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                    opt.step()
+        best_move = None
+        best_visits = -1
 
-        venv.close()
-        if plot:
-            wins = 0
-            total = 0
-            ys = []
-            for i in range(min(100, len(scores))):
-                wins += scores[i]
-                total += 1
-                ys.append(wins / total)
-            for i in range(100, len(scores)):
-                wins += scores[i]
-                wins -= scores[i - 100]
-                ys.append(wins / total)
-            xs = np.arange(1, len(ys) + 1)
-            tail_scores = np.asarray(scores[:len(ys)], dtype=float)
+        for move, child in root.children.items():
+            if child.number_of_visits > best_visits:
+                best_visits = child.number_of_visits
+                best_move = move
 
-            plt.figure()
-            plt.plot(xs, tail_scores, linewidth=1, alpha=0.35, label='score (win=1 / loss=0)')
-            plt.plot(xs, ys, linewidth=2, label='rolling mean (≤100 games)')
-            plt.ylim(-0.05, 1.05)
-            plt.xlabel('Game #')
-            plt.ylabel('Win (1) / Loss (0)')
-            plt.title('Rolling winrate')
-            plt.legend()
-            plt.tight_layout()
-            plt.show()
+        return best_move
+
+    def _policy_from_root(self, root: Node):
+        """
+        Строим распределение по ходам из корня:
+        prob(move) пропорционально number of visits(child)
+        """
+
+        visits = {move: child.number_of_visits for move, child in root.children.items()}
+        total = sum(visits.values())
+        if total == 0:
+            n = len(visits)
+            return {move: 1.0 / n for move in visits.keys()}
+
+        return {move: v / total for move, v in visits.items()}
+
+    def _rollout(self, board: chess.Board, player_to_move_at_root: bool, max_depth: int = 100) -> float:
+        """
+        Простой rollout: играем случайными ходами до конца партии или max_depth.
+        Возвращаем результат с точки зрения player_to_move_at_root.
+        """
+        b = board.copy()
+        depth = 0
+        while not b.is_game_over() and depth < max_depth:
+            moves = self._get_legal_moves(b)
+            if not moves:
+                break
+            move = random.choice(moves)
+            b.push(move)
+            depth += 1
+
+        if not b.is_game_over():
+            return 0.0
+
+        outcome = b.outcome()
+        if outcome is None or outcome.winner is None:
+            return 0.0
+
+        winner = outcome.winner
+        return 1.0 if winner == player_to_move_at_root else -1.0
 
 
+    def _get_legal_moves(self, board: chess.Board):
+        return list(board.legal_moves)
+
+    def _is_terminal(self, board: chess.Board) -> bool:
+        return board.is_game_over()
+
+    def _evaluate_terminal(self, board: chess.Board, player_to_move: bool) -> float:
+        outcome = board.outcome()
+        if outcome is None or outcome.winner is None:
+            return 0.0
+
+        winner = outcome.winner
+        if winner == player_to_move:
+            return 1.0
+        else:
+            return -1.0
+
+    def _material(self, board: chess.Board, color: bool) -> int:
+        total = 0
+        for piece in board.piece_map().values():
+            if piece.color == color:
+                total += PIECE_VALUES[piece.piece_type]
+        return total
+
+    def _evaluate_position(self, board: chess.Board, root_player: bool) -> float:
+        """
+        Оценка нетерминальной позиции по материалу с точки зрения root_player
+        Возвращает диапазон примерно [-1, 1].
+        """
+        assert not board.is_game_over()
+
+        white_mat = self._material(board, chess.WHITE)
+        black_mat = self._material(board, chess.BLACK)
+
+        if root_player == chess.WHITE:
+            diff = white_mat - black_mat
+        else:
+            diff = black_mat - white_mat
+
+        # нормируем
+        return max(-1.0, min(1.0, diff / 20.0))
+
+    def _evaluate_position_nn(self, board: chess.Board, root_player: bool) -> float:
+        """
+        Оцениваем позицию нейросетью.
+        Сеть обучена давать value с точки зрения игрока, который ходит.
+        Здесь мы переводим это к точке зрения root_player.
+        """
+        assert self.model is not None
+
+        obs = board_to_obs(board, position_deque)
+        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        with torch.no_grad():
+            v_pred = self.model.values_only(obs_t)
+            v = float(v_pred.item())
+
+        if board.turn != root_player:
+            v = -v
+        return v

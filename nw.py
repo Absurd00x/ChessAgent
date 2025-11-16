@@ -2,7 +2,7 @@ import torch.distributions as D
 import torch.nn as nn
 import torch
 
-from env import TOTAL_LAYERS, TOTAL_MOVES
+from constants import TOTAL_LAYERS, TOTAL_MOVES
 
 
 
@@ -59,6 +59,7 @@ class CNNActorCritic(nn.Module):
             critic_layers.append(critic_activation_function())
             in_dim = h
         critic_layers.append(nn.Linear(in_dim, 1))
+        critic_layers.append(nn.Tanh())
         self.critic = nn.Sequential(*critic_layers)
 
     def _features(self, x):

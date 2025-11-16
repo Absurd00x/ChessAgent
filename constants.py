@@ -1,0 +1,21 @@
+import chess
+
+BOARD_LAYERS = 12
+EN_PASSANT_LAYERS = 1
+CASTLES_LAYERS = 4
+TURN_LAYERS = 1
+LAST_POSITIONS = 8
+META_LAYERS = EN_PASSANT_LAYERS + CASTLES_LAYERS + TURN_LAYERS
+TOTAL_LAYERS = META_LAYERS + LAST_POSITIONS * BOARD_LAYERS
+CHECKPOINT_PATH = "checkpoints/alphazero_like.pth"
+
+TOTAL_MOVES = 4672
+
+PIECE_VALUES = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK: 5,
+    chess.QUEEN: 9,
+    chess.KING: 100,  # короля обычно не считаем в материале
+}
