@@ -7,7 +7,15 @@ import torch
 import torch.nn.functional as F
 from nw import CNNActorCritic
 from collections import deque
-from constants import LAST_POSITIONS, TOTAL_MOVES, PIECE_VALUES
+from constants import (
+    LAST_POSITIONS,
+    TOTAL_MOVES,
+    PIECE_VALUES,
+    BATCH_SIZE,
+    MIN_REPLAY_SIZE,
+    TRAIN_STEPS_PER_ITER,
+)
+from replay_buffer import replay_buffer
 
 position_deque = deque(maxlen=LAST_POSITIONS)
 
@@ -44,11 +52,31 @@ def self_play_game(model: CNNActorCritic,
     trajectory = []
     moves_cnt = 0
 
+    temperature_moves = 20  # первые 20 полуходов выбираем с температурой
+
     while not board.is_game_over() and moves_cnt < max_moves:
         player = board.turn
         obs = board_to_obs(board, position_deque)
-        move, policy = mcts.run(board)
+
+        # MCTS c шумом Дирихле в корне
+        move, policy = mcts.run(board, add_dirichlet_noise=True)
+
+        # π всегда берём как нормализованные visit counts
         pi_vec = policy_to_pi_vector(board, policy)
+
+        # Для первых ходов выбираем действие случайно из policy
+        if moves_cnt < temperature_moves:
+            moves_list = list(policy.keys())
+            probs = np.array([policy[m] for m in moves_list], dtype=np.float64)
+            s = probs.sum()
+            if s <= 0:
+                # деградация на всякий случай
+                probs = np.ones(len(moves_list), dtype=np.float64) / len(moves_list)
+            else:
+                probs /= s
+            idx = np.random.choice(len(moves_list), p=probs)
+            move = moves_list[idx]
+        # после temperature_moves оставляем move, который вернул MCTS (argmax)
 
         trajectory.append((obs, pi_vec, player))
         board.push(move)
@@ -74,42 +102,86 @@ def train_one_iteration(model: CNNActorCritic,
                         num_simulations=64,
                         max_moves=200,
                         device="cpu"):
+    """
+    Одна итерация обучения:
+      1) генерируем одну self-play партию (self_play_game),
+      2) добавляем все позиции в replay buffer,
+      3) делаем несколько SGD- шагов по случайным минибатчам из буфера.
 
+    Возвращает словарь со статистикой.
+    """
+
+    # 1. self-play: одна партия
     data = self_play_game(model=model,
                           num_simulations=num_simulations,
                           max_moves=max_moves,
                           device=device)
-    assert data is not None, "Не поступило данных для обучения в train_one_iteration()"
+    if data is None or len(data) == 0:
+        return None
 
-    obs_list, pi_list, z_list = zip(*data)
+    # 2. добавляем позиции партии в буфер
+    replay_buffer.add_many(data)
+    buffer_size = len(replay_buffer)
 
-    obs_batch = np.stack(obs_list, axis=0)
-    pi_batch = np.stack(pi_list, axis=0)
-    z_batch = np.array(z_list, dtype=np.float32)
+    # Если данных совсем мало — просто копим буфер, почти не обучаясь
+    if buffer_size < BATCH_SIZE:
+        return {
+            "loss": 0.0,
+            "value_loss": 0.0,
+            "policy_loss": 0.0,
+            "num_positions": len(data),   # сколько позиций добавили
+            "buffer_size": buffer_size,
+            "train_steps": 0,
+            "positions_used_for_training": 0,
+        }
 
-    obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
-    pi_t = torch.as_tensor(pi_batch, dtype=torch.float32, device=device)
-    z_t = torch.as_tensor(z_batch, dtype=torch.float32, device=device)
+    # Сколько шагов SGD делаем на этой итерации
+    if buffer_size < MIN_REPLAY_SIZE:
+        # тёплый старт: буфер ещё небольшой → один шаг
+        train_steps = 1
+    else:
+        train_steps = TRAIN_STEPS_PER_ITER
 
-    logits, v_pred = model(obs_t)
+    last_loss = 0.0
+    last_value_loss = 0.0
+    last_policy_loss = 0.0
+    total_positions_used = 0
 
-    value_loss = F.mse_loss(v_pred, z_t)
+    model.train()
 
-    log_probs = torch.log_softmax(logits, dim=-1)
-    policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
+    for _ in range(train_steps):
+        obs_batch, pi_batch, z_batch = replay_buffer.sample(BATCH_SIZE)
+        total_positions_used += len(z_batch)
 
-    loss = value_loss + policy_loss
+        obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
+        pi_t = torch.as_tensor(pi_batch, dtype=torch.float32, device=device)
+        z_t = torch.as_tensor(z_batch, dtype=torch.float32, device=device)
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+        logits, v_pred = model(obs_t)
+
+        value_loss = F.mse_loss(v_pred, z_t)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
+        loss = value_loss + policy_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        last_loss = float(loss.item())
+        last_value_loss = float(value_loss.item())
+        last_policy_loss = float(policy_loss.item())
 
     return {
-        "loss": float(loss.item()),
-        "value_loss": float(value_loss.item()),
-        "policy_loss": float(policy_loss.item()),
-        "num_positions": len(data),
+        "loss": last_loss,
+        "value_loss": last_value_loss,
+        "policy_loss": last_policy_loss,
+        "num_positions": len(data),                 # добавлено в буфер
+        "buffer_size": buffer_size,                 # размер буфера после добавления
+        "train_steps": train_steps,                 # сколько SGD-шагов
+        "positions_used_for_training": total_positions_used,
     }
+
 
 
 class Node:
@@ -161,20 +233,54 @@ class MCTS:
              / (1.0 + child.number_of_visits))
         return q + u
 
-    def run(self, root_state):
+    def run(self, root_state, add_dirichlet_noise: bool = False):
         """
         Главный метод:
-        - root_state — это будет chess.Board, но пока мы делаем абстрактно.
-        - Вернёт лучшую action и, возможно, распределение по действиям.
+        - root_state — chess.Board
+        - Вернёт лучшую action и распределение policy по действиям.
+        - Если add_dirichlet_noise=True, то в корне добавляем шум Дирихле
+          к приорам (используется только в self-play).
         """
         root = Node(prior=1.0, player_to_move=self._player_to_move(root_state))
+
+        dirichlet_applied = False
 
         for _ in range(self.number_of_simulations):
             self._simulate(root_state, root)
 
+            # Как только у корня появились дети — один раз
+            # добавляем к их prior'ам шум Дирихле
+            if add_dirichlet_noise and (not dirichlet_applied) and root.children:
+                self._add_dirichlet_noise(root)
+                dirichlet_applied = True
+
         best_action = self._select_action_from_root(root)
         policy = self._policy_from_root(root)
         return best_action, policy
+
+    def _add_dirichlet_noise(self, root: Node,
+                             alpha: float = 0.3,
+                             epsilon: float = 0.25):
+        """
+        Добавляем шум Дирихле к приорам в корне дерева.
+        Используем только в self-play, чтобы дебюты были разнообразнее.
+
+        root.children[move].prior_probability
+        <- (1 - eps) * prior + eps * noise_i
+        """
+        if not root.children:
+            return
+
+        n = len(root.children)
+        # генерируем вектор шума из Dirichlet(alpha)
+        noise = np.random.dirichlet([alpha] * n)
+
+        for child, n_i in zip(root.children.values(), noise):
+            child.prior_probability = (
+                (1.0 - epsilon) * child.prior_probability
+                + epsilon * float(n_i)
+            )
+
 
     def _player_to_move(self, state:chess.Board):
         """

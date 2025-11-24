@@ -142,10 +142,13 @@ def main(device: str="cuda"):
 
             print(
                 f"Iter {i}: "
-                f"loss={stats['loss']:.4f} "
-                f"policy_loss={stats['policy_loss']:.4f} "
-                f"value_loss={stats['value_loss']:.4f} "
-                f"positions={stats['num_positions']}"
+                f"loss={stats['loss']:.8f} "
+                f"policy_loss={stats['policy_loss']:.8f} "
+                f"value_loss={stats['value_loss']:.8f} "
+                f"positions={stats['num_positions']} "
+                f"buffer={stats.get('buffer_size', 0)} "
+                f"steps={stats.get('train_steps', 0)} "
+                f"train_pos_used={stats.get('positions_used_for_training', 0)}"
             )
 
             # периодически сохраняем модель
