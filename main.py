@@ -8,6 +8,7 @@ import os
 from agent import MCTS, board_to_obs, policy_to_pi_vector, self_play_game, train_one_iteration
 import chess
 from constants import CHECKPOINT_PATH
+from replay_buffer import load_replay_buffer, save_replay_buffer
 
 def play_game_mcts_vs_random(num_simulations=256, max_moves=200):
     board = chess.Board()
@@ -124,6 +125,13 @@ def main(device: str="cuda"):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
+    # Загрузка replay buffer, если файл существует
+    print("Trying to load replay buffer...")
+    if load_replay_buffer():
+        print("Replay buffer loaded from disk.")
+    else:
+        print("No replay buffer found, starting with an empty buffer.")
+
     print("Starting infinite self-play training loop. Press Ctrl+C to stop.")
 
     i = 0
@@ -152,14 +160,19 @@ def main(device: str="cuda"):
                 f"train_pos_used={stats.get('positions_used_for_training', 0)}"
             )
 
-            # периодически сохраняем модель
+            # периодически сохраняем модель и replay buffer
             if i % 10 == 0:
                 torch.save(model.state_dict(), CHECKPOINT_PATH)
                 print(f"Checkpoint saved at iter {i}")
+                save_replay_buffer()
+                print(f"Replay buffer saved at iter {i}")
+
     except KeyboardInterrupt:
-        print("\nKeyboardInterrupt caught. Saving final checkpoint...")
+        print("\nKeyboardInterrupt caught. Saving final checkpoint and replay buffer...")
         torch.save(model.state_dict(), CHECKPOINT_PATH)
+        save_replay_buffer()
         print(f"Final model saved to {CHECKPOINT_PATH}")
+        print("Replay buffer saved to replay_buffer.npz")
 
 if __name__ == "__main__":
     # play_game_mcts_vs_random()

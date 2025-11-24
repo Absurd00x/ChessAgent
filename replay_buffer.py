@@ -1,5 +1,6 @@
 # replay_buffer.py
 import random
+import os
 from typing import List, Tuple
 
 import numpy as np
@@ -7,7 +8,8 @@ import numpy as np
 from constants import (
     TOTAL_LAYERS,
     TOTAL_MOVES,
-    REPLAY_CAPACITY
+    REPLAY_CAPACITY,
+    DEFAULT_REPLAY_PATH
 )
 
 
@@ -80,3 +82,59 @@ class ReplayBuffer:
 
 # Глобальный буфер, который импортируем в agent.py
 replay_buffer = ReplayBuffer(REPLAY_CAPACITY)
+
+def save_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> None:
+    """
+    Сохраняем текущее содержимое буфера (только первые sz элементов)
+    в .npz-файл. Используем сжатие, чтобы меньше занимать место.
+    """
+    rb = replay_buffer
+    if rb.sz == 0:
+        return
+
+    np.savez_compressed(
+        path,
+        obs=rb.obs[:rb.sz],
+        pi=rb.pi[:rb.sz],
+        z=rb.z[:rb.sz],
+        idx=np.int64(rb.idx),
+        sz=np.int64(rb.sz),
+        capacity=np.int64(rb.capacity),
+    )
+
+
+def load_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> bool:
+    """
+    Пытаемся загрузить буфер из файла.
+    Возвращает True, если успешно, False, если файл не найден.
+    """
+    if not os.path.exists(path):
+        return False
+
+    data = np.load(path, allow_pickle=False)
+
+    obs = data["obs"]
+    pi = data["pi"]
+    z = data["z"]
+    saved_idx = int(data["idx"])
+    saved_sz = int(data["sz"])
+    saved_capacity = int(data["capacity"])
+
+    rb = replay_buffer
+
+    # Если сохранённый capacity больше текущего — пересоздадим массивы
+    if saved_capacity > rb.capacity:
+        rb.capacity = saved_capacity
+        rb.obs = np.zeros((saved_capacity, TOTAL_LAYERS, 8, 8), dtype=np.float32)
+        rb.pi = np.zeros((saved_capacity, TOTAL_MOVES), dtype=np.float32)
+        rb.z = np.zeros((saved_capacity,), dtype=np.float32)
+
+    # Копируем данные
+    rb.obs[:saved_sz] = obs
+    rb.pi[:saved_sz] = pi
+    rb.z[:saved_sz] = z
+
+    rb.sz = saved_sz
+    rb.idx = saved_idx % rb.capacity
+
+    return True
