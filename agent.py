@@ -168,9 +168,9 @@ def train_one_iteration(model: CNNActorCritic,
         loss.backward()
         optimizer.step()
 
-        last_loss = float(loss.item())
-        last_value_loss = float(value_loss.item())
-        last_policy_loss = float(policy_loss.item())
+        last_loss = float(loss.detach().item())
+        last_value_loss = float(value_loss.detach().item())
+        last_policy_loss = float(policy_loss.detach().item())
 
     return {
         "loss": last_loss,
