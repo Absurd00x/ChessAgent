@@ -86,15 +86,20 @@ def self_play_game(model: CNNActorCritic,
     outcome = board.outcome()
     if outcome is None or outcome.winner is None:
         z_white = 0.0
+        winner = None
     else:
-        z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
+        if outcome.winner == chess.WHITE:
+            z_white = 1.0
+        else:
+            z_white = -1.0
 
     data = []
     for obs, pi_vec, player in trajectory:
         z = z_white if player == chess.WHITE else -z_white
         data.append((obs, pi_vec, z))
 
-    return data
+    exceeded_max_moves = (moves_cnt == max_moves)
+    return data, exceeded_max_moves
 
 
 def train_one_iteration(model: CNNActorCritic,
@@ -112,10 +117,10 @@ def train_one_iteration(model: CNNActorCritic,
     """
 
     # 1. self-play: одна партия
-    data = self_play_game(model=model,
-                          num_simulations=num_simulations,
-                          max_moves=max_moves,
-                          device=device)
+    data, exceeded_move_limit = self_play_game(model=model,
+                                               num_simulations=num_simulations,
+                                               max_moves=max_moves,
+                                               device=device)
     if data is None or len(data) == 0:
         return None
 
@@ -133,6 +138,7 @@ def train_one_iteration(model: CNNActorCritic,
             "buffer_size": buffer_size,
             "train_steps": 0,
             "positions_used_for_training": 0,
+            "exceeded move limit": None
         }
 
     # Сколько шагов SGD делаем на этой итерации
@@ -180,6 +186,7 @@ def train_one_iteration(model: CNNActorCritic,
         "buffer_size": buffer_size,                 # размер буфера после добавления
         "train_steps": train_steps,                 # сколько SGD-шагов
         "positions_used_for_training": total_positions_used,
+        "exceeded_move_limit": exceeded_move_limit,
     }
 
 

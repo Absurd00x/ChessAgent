@@ -106,6 +106,9 @@ def save_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> None:
 def load_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> bool:
     """
     Пытаемся загрузить буфер из файла.
+    Если в файле записей больше, чем текущий capacity,
+    самые старые записи отбрасываются, остаются только
+    последние `replay_buffer.capacity` позиций.
     Возвращает True, если успешно, False, если файл не найден.
     """
     if not os.path.exists(path):
@@ -113,28 +116,68 @@ def load_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> bool:
 
     data = np.load(path, allow_pickle=False)
 
-    obs = data["obs"]
-    pi = data["pi"]
-    z = data["z"]
+    obs = data["obs"]  # shape: (saved_sz, TOTAL_LAYERS, 8, 8)
+    pi = data["pi"]    # shape: (saved_sz, TOTAL_MOVES)
+    z = data["z"]      # shape: (saved_sz,)
     saved_idx = int(data["idx"])
     saved_sz = int(data["sz"])
     saved_capacity = int(data["capacity"])
 
     rb = replay_buffer
+    new_capacity = rb.capacity  # что задано текущей константой REPLAY_CAPACITY
 
-    # Если сохранённый capacity больше текущего — пересоздадим массивы
-    if saved_capacity > rb.capacity:
-        rb.capacity = saved_capacity
-        rb.obs = np.zeros((saved_capacity, TOTAL_LAYERS, 8, 8), dtype=np.float32)
-        rb.pi = np.zeros((saved_capacity, TOTAL_MOVES), dtype=np.float32)
-        rb.z = np.zeros((saved_capacity,), dtype=np.float32)
+    if saved_sz == 0:
+        # В файле пустой буфер
+        rb.sz = 0
+        rb.idx = 0
+        return True
 
-    # Копируем данные
-    rb.obs[:saved_sz] = obs
-    rb.pi[:saved_sz] = pi
-    rb.z[:saved_sz] = z
+    # Сколько реально хотим сохранить после загрузки
+    keep_sz = min(saved_sz, new_capacity)
 
-    rb.sz = saved_sz
-    rb.idx = saved_idx % rb.capacity
+    # Массивы под новый буфер (ориентируемся на ТЕКУЩИЙ capacity)
+    rb.obs = np.zeros((new_capacity, TOTAL_LAYERS, 8, 8), dtype=np.float32)
+    rb.pi  = np.zeros((new_capacity, TOTAL_MOVES), dtype=np.float32)
+    rb.z   = np.zeros((new_capacity,), dtype=np.float32)
+    rb.capacity = new_capacity
+
+    if saved_sz <= new_capacity:
+        # Помещаются все записи — просто копируем "как есть"
+        rb.obs[:saved_sz] = obs[:saved_sz]
+        rb.pi[:saved_sz]  = pi[:saved_sz]
+        rb.z[:saved_sz]   = z[:saved_sz]
+
+        rb.sz = saved_sz
+        # Буфер не полный => следующий индекс — просто sz
+        rb.idx = saved_sz % new_capacity
+    else:
+        # saved_sz > new_capacity — нужно выбросить самые старые
+        # Оставляем последние `keep_sz` записей по времени
+
+        if saved_sz < saved_capacity:
+            # Буфер не успел заполниться при сохранении:
+            # хронологический порядок — просто индексы 0..saved_sz-1
+            start = saved_sz - keep_sz
+            sel = np.arange(start, saved_sz)
+        else:
+            # Буфер был полон, хронологический порядок — кольцевой.
+            # saved_idx — позиция СЛЕДУЮЩЕЙ записи;
+            # самая старая запись сейчас в индексе saved_idx.
+            # Хронологический порядок индексов:
+            # (saved_idx + 0) % saved_capacity, ...,
+            # (saved_idx + saved_sz - 1) % saved_capacity.
+            start_ch = saved_sz - keep_sz  # с какого места брать последние keep_sz
+            j = np.arange(start_ch, saved_sz)  # хронологические индексы
+            sel = (saved_idx + j) % saved_capacity
+
+        # Перекладываем выбранные индексы плотно с 0 до keep_sz-1
+        rb.obs[:keep_sz] = obs[sel]
+        rb.pi[:keep_sz]  = pi[sel]
+        rb.z[:keep_sz]   = z[sel]
+
+        rb.sz = keep_sz
+        # Если буфер теперь полон, idx = 0 (след. запись перезатрет самую старую),
+        # если нет — idx = sz.
+        rb.idx = keep_sz % new_capacity
 
     return True

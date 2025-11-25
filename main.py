@@ -1,4 +1,5 @@
 import random
+import time
 from sys import setrecursionlimit
 
 import torch
@@ -7,7 +8,7 @@ from nw import CNNActorCritic
 import os
 from agent import MCTS, board_to_obs, policy_to_pi_vector, self_play_game, train_one_iteration
 import chess
-from constants import CHECKPOINT_PATH
+from constants import CHECKPOINT_PATH, TRAINING_MCTS_SIMULATIONS, TRAINING_MAX_MOVES
 from replay_buffer import load_replay_buffer, save_replay_buffer
 
 def play_game_mcts_vs_random(num_simulations=256, max_moves=200):
@@ -135,16 +136,23 @@ def main(device: str="cuda"):
     print("Starting infinite self-play training loop. Press Ctrl+C to stop.")
 
     i = 0
+    total_elapsed = 0
+    exceeded_move_limit_games = 0
     try:
         while True:
             i += 1
+            time_start = time.perf_counter()
             stats = train_one_iteration(
                 model,
                 optimizer,
-                num_simulations=512,
-                max_moves=200,
+                num_simulations=TRAINING_MCTS_SIMULATIONS,
+                max_moves=TRAINING_MAX_MOVES,
                 device=device,
             )
+            time_finish = time.perf_counter()
+            elapsed = time_finish - time_start
+            total_elapsed += elapsed
+            exceeded_move_limit_games += stats.get("exceeded_move_limit")
 
             if stats is None:
                 continue
@@ -153,17 +161,21 @@ def main(device: str="cuda"):
                 f"Iter {i}: "
                 f"loss={stats['loss']:.8f} "
                 f"policy_loss={stats['policy_loss']:.8f} "
-                f"value_loss={stats['value_loss']:.8f} "
+                f"value_loss={stats['value_loss']:.8f}\n"
                 f"positions={stats['num_positions']} "
                 f"buffer={stats.get('buffer_size', 0)} "
                 f"steps={stats.get('train_steps', 0)} "
-                f"train_pos_used={stats.get('positions_used_for_training', 0)}"
+                f"train_pos_used={stats.get('positions_used_for_training', 0)}\n"
+                f"elapsed={elapsed:.3f} seconds, "
+                f"average per game={total_elapsed/i:.3f} seconds\n"
+                f"exceeded_move_limit={exceeded_move_limit_games*100/i:.3f}%\n"
             )
 
             # периодически сохраняем модель и replay buffer
             if i % 10 == 0:
                 torch.save(model.state_dict(), CHECKPOINT_PATH)
                 print(f"Checkpoint saved at iter {i}")
+            if i % 100 == 0:
                 save_replay_buffer()
                 print(f"Replay buffer saved at iter {i}")
 
