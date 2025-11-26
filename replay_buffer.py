@@ -88,6 +88,7 @@ def save_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> None:
     Сохраняем текущее содержимое буфера (только первые sz элементов)
     в .npz-файл. Используем сжатие, чтобы меньше занимать место.
     """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     rb = replay_buffer
     if rb.sz == 0:
         return

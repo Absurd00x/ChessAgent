@@ -152,10 +152,11 @@ def main(device: str="cuda"):
             time_finish = time.perf_counter()
             elapsed = time_finish - time_start
             total_elapsed += elapsed
-            exceeded_move_limit_games += stats.get("exceeded_move_limit")
 
             if stats is None:
                 continue
+
+            exceeded_move_limit_games += int(stats.get("exceeded_move_limit", 0))
 
             print(
                 f"Iter {i}: "

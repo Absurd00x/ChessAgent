@@ -48,6 +48,7 @@ def self_play_game(model: CNNActorCritic,
                 device=device)
     board = chess.Board()
     position_deque.clear()
+    position_deque.append(board_to_planes(board))
 
     trajectory = []
     moves_cnt = 0
@@ -98,7 +99,7 @@ def self_play_game(model: CNNActorCritic,
         z = z_white if player == chess.WHITE else -z_white
         data.append((obs, pi_vec, z))
 
-    exceeded_max_moves = (moves_cnt == max_moves)
+    exceeded_max_moves = (moves_cnt == max_moves) and (not board.is_game_over())
     return data, exceeded_max_moves
 
 
@@ -138,7 +139,7 @@ def train_one_iteration(model: CNNActorCritic,
             "buffer_size": buffer_size,
             "train_steps": 0,
             "positions_used_for_training": 0,
-            "exceeded move limit": None
+            "exceeded_move_limit": exceeded_move_limit
         }
 
     # Сколько шагов SGD делаем на этой итерации
@@ -231,7 +232,7 @@ class MCTS:
         if child.number_of_visits == 0:
             q = 0.0
         else:
-            q = child.mean_value
+            q = -child.mean_value
 
         _eps = 1e-8
         u = (self.c_puct
@@ -306,6 +307,8 @@ class MCTS:
         - поднимать value вверх (Backup).
         """
         board = state.copy()
+        
+        hist = deque(position_deque, maxlen=LAST_POSITIONS)
 
         path = [root_node]
         node = root_node
@@ -331,6 +334,7 @@ class MCTS:
             assert best_child is not None, "MCTS: best_child is None, дерево в неконсистентном состоянии"
 
             board.push(best_move)
+            hist.append(board_to_planes(board))
             node = best_child
             path.append(node)
 
@@ -345,7 +349,7 @@ class MCTS:
             assert legal_moves, "MCTS: нет легальных ходов в нетерминальной позиции"
             assert self.model is not None, "MCTS: модель не передали, получил None"
 
-            obs = board_to_obs(board, position_deque)
+            obs = board_to_obs(board, hist)
             obs_t = torch.as_tensor(obs, dtype=torch.float32,
                                     device=self.device).unsqueeze(0)
 
@@ -366,6 +370,14 @@ class MCTS:
                 p = float(probs[action_id])
                 priors[move] = p
                 total_p += p
+                
+            if total_p <= 1e-12:
+                p0 = 1.0 / len(legal_moves)
+                for move in legal_moves:
+                    priors[move] = p0
+            else:
+                for move in legal_moves:
+                    priors[move] /= total_p
 
             for move in legal_moves:
                 child = Node(prior=priors[move],
@@ -379,6 +391,7 @@ class MCTS:
             node.number_of_visits += 1
             node.value += value
             node.mean_value = node.value / node.number_of_visits
+            value = -value
 
     def _select_action_from_root(self, root: Node):
         """

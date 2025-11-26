@@ -61,6 +61,7 @@ def new_game():
     board = chess.Board()
 
     position_deque.clear()
+    position_deque.append(board_to_planes(board))
 
     return MoveResponse(
         board_fen=board.fen(),
