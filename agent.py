@@ -241,7 +241,7 @@ class MCTS:
              / (1.0 + child.number_of_visits))
         return q + u
 
-    def run(self, root_state, add_dirichlet_noise: bool = False):
+    def run(self, root_state, position_history=None, add_dirichlet_noise: bool = False):
         """
         Главный метод:
         - root_state — chess.Board
@@ -254,7 +254,7 @@ class MCTS:
         dirichlet_applied = False
 
         for _ in range(self.number_of_simulations):
-            self._simulate(root_state, root)
+            self._simulate(root_state, root, position_history=position_history)
 
             # Как только у корня появились дети — один раз
             # добавляем к их prior'ам шум Дирихле
@@ -296,7 +296,7 @@ class MCTS:
         """
         return state.turn
 
-    def _simulate(self, state: chess.Board, root_node: Node):
+    def _simulate(self, state: chess.Board, root_node: Node, position_history=None):
         """
         Одна MCTS-симуляция.
         state: текущее состояние доски
@@ -307,8 +307,9 @@ class MCTS:
         - поднимать value вверх (Backup).
         """
         board = state.copy()
-        
-        hist = deque(position_deque, maxlen=LAST_POSITIONS)
+
+        base_hist = position_history if position_history is not None else position_deque
+        hist = deque(base_hist, maxlen=LAST_POSITIONS)
 
         path = [root_node]
         node = root_node

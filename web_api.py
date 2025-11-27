@@ -1,175 +1,400 @@
+from __future__ import annotations
+
+import os
+from collections import deque
+
+import chess
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import chess
-import torch
 
-from nw import CNNActorCritic
-from agent import MCTS, position_deque
+from constants import CHECKPOINT_PATH, LAST_POSITIONS
+from db import SessionLocal, Game, Move, create_tables
 from env import board_to_planes
-from constants import CHECKPOINT_PATH
+from nw import CNNActorCritic
+from agent import MCTS
 
 
 app = FastAPI(
-    title="Chess AlphaZero-like API",
-    description="Простой API для игры против шахматного агента",
+    title="Chess Agent Web API",
+    description="Игра в шахматы против агента. Есть web UI, API, хранение в БД.",
 )
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Глобальные объекты
 
-# Одна доска на всё приложение
-board: chess.Board | None = None
+@app.on_event("startup")
+def _startup():
+    create_tables()
 
-device = "cpu"
+
+# -------- model / mcts --------
+def _pick_device() -> str:
+    dev = os.getenv("DEVICE", "cpu")
+    if dev.startswith("cuda") and not torch.cuda.is_available():
+        return "cpu"
+    return dev
+
+
+device = _pick_device()
 model = CNNActorCritic().to(device)
 
-try:
+if os.path.exists(CHECKPOINT_PATH):
     state_dict = torch.load(CHECKPOINT_PATH, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
-except FileNotFoundError:
-    raise RuntimeError(
-        f"Не найден файл с весами по пути {CHECKPOINT_PATH}. "
-        f"Убедись, что модель обучена и файл существует."
-    )
+else:
+    # чтобы сервис запускался даже без весов
+    print(f"[WARN] checkpoint not found: {CHECKPOINT_PATH}. Using random weights.")
+    model.eval()
 
-mcts = MCTS(number_of_simulations=1024, model=model, device=device)
+WEB_MCTS_SIMULATIONS = int(os.getenv("WEB_MCTS_SIMULATIONS", "256"))
+mcts = MCTS(number_of_simulations=WEB_MCTS_SIMULATIONS, model=model, device=device)
+
+
+# -------- schemas --------
+class NewGameRequest(BaseModel):
+    human_color: str = "w"  # "w" or "b"
 
 
 class MoveRequest(BaseModel):
+    game_id: str
     from_square: str
     to_square: str
-    promotion: str | None = None
+    promotion: str | None = None  # "q/r/b/n" or None
+
+
+class EngineMoveRequest(BaseModel):
+    game_id: str
+
 
 class MoveResponse(BaseModel):
+    game_id: str
     board_fen: str
     engine_move: str | None
+    moves_san: list[str]
     game_over: bool
     result: str | None
+    termination: str | None
 
 
-def _ensure_game_started():
-    if board is None:
-        raise HTTPException(status_code=400, detail="Игра ещё не начата. Вызови /new_game.")
+# -------- helpers --------
+def _promotion_piece(p: str | None):
+    if not p:
+        return None
+    promo_map = {"q": chess.QUEEN, "r": chess.ROOK, "b": chess.BISHOP, "n": chess.KNIGHT}
+    out = promo_map.get(p.lower())
+    if out is None:
+        raise HTTPException(status_code=400, detail="Некорректная фигура для превращения (q/r/b/n)")
+    return out
+
+
+def _outcome_info(board: chess.Board):
+    if not board.is_game_over():
+        return False, None, None
+    outcome = board.outcome()
+    result = board.result()
+    termination = outcome.termination.name if outcome is not None else None
+    return True, result, termination
+
+
+def _load_board_and_hist(db, game: Game):
+    """
+    Восстанавливаем board и историю последних позиций из БД ходов.
+    Это делает сервис stateless (не зависит от глобальной board/position_deque).
+    """
+    rows = (
+        db.query(Move)
+        .filter(Move.game_id == game.id)
+        .order_by(Move.ply)
+        .all()
+    )
+
+    board = chess.Board()
+    hist = deque(maxlen=LAST_POSITIONS)
+    hist.append(board_to_planes(board))
+
+    for r in rows:
+        mv = chess.Move.from_uci(r.uci)
+        if mv not in board.legal_moves:
+            raise HTTPException(status_code=500, detail=f"БД содержит нелегальный ход: {r.uci}")
+        board.push(mv)
+        hist.append(board_to_planes(board))
+
+    return board, hist, rows
+
+
+def _moves_san(rows: list[Move]) -> list[str]:
+    return [r.san for r in rows]
+
+
+def _get_game(db, game_id: str) -> Game:
+    g = db.get(Game, game_id)
+    if g is None:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return g
+
+
+def _human_color_bool(human_color: str) -> bool:
+    if human_color not in ("w", "b"):
+        raise HTTPException(status_code=400, detail="human_color must be 'w' or 'b'")
+    return chess.WHITE if human_color == "w" else chess.BLACK
+
+
+def _save_move(db, game: Game, board: chess.Board, mv: chess.Move):
+    # SAN надо брать ДО push
+    san = board.san(mv)
+    ply = len(board.move_stack) + 1
+    board.push(mv)
+    db.add(Move(game_id=game.id, ply=ply, uci=mv.uci(), san=san))
+
+
+# -------- endpoints --------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.post("/new_game", response_model=MoveResponse)
-def new_game():
-    global board
-    board = chess.Board()
+def new_game(req: NewGameRequest):
+    human_color = req.human_color if req.human_color in ("w", "b") else "w"
+    human_bool = _human_color_bool(human_color)
 
-    position_deque.clear()
-    position_deque.append(board_to_planes(board))
+    with SessionLocal() as db:
+        board = chess.Board()
+        g = Game(human_color=human_color, fen=board.fen(), status="ongoing", result=None)
+        db.add(g)
+        db.commit()
+        db.refresh(g)
 
-    return MoveResponse(
-        board_fen=board.fen(),
-        engine_move=None,
-        game_over=False,
-        result=None,
-    )
+        engine_move_uci = None
+
+        # Если человек играет чёрными — движок делает первый ход сразу
+        if human_bool == chess.BLACK:
+            board_hist = deque(maxlen=LAST_POSITIONS)
+            board_hist.append(board_to_planes(board))
+
+            mv, _policy = mcts.run(board, position_history=board_hist)
+            if mv is None:
+                raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
+            _save_move(db, g, board, mv)
+            engine_move_uci = mv.uci()
+
+        game_over, result, termination = _outcome_info(board)
+        g.fen = board.fen()
+        if game_over:
+            g.status = "finished"
+            g.result = result
+        db.commit()
+
+        rows = (
+            db.query(Move)
+            .filter(Move.game_id == g.id)
+            .order_by(Move.ply)
+            .all()
+        )
+
+        return MoveResponse(
+            game_id=g.id,
+            board_fen=board.fen(),
+            engine_move=engine_move_uci,
+            moves_san=_moves_san(rows),
+            game_over=game_over,
+            result=result,
+            termination=termination,
+        )
 
 
 @app.post("/make_move", response_model=MoveResponse)
 def make_move(req: MoveRequest):
-    global board
-    _ensure_game_started()
-    assert board is not None
+    with SessionLocal() as db:
+        g = _get_game(db, req.game_id)
 
-    # Ход человека
+        board, hist, rows = _load_board_and_hist(db, g)
+        if board.is_game_over():
+            game_over, result, termination = _outcome_info(board)
+            return MoveResponse(
+                game_id=g.id,
+                board_fen=board.fen(),
+                engine_move=None,
+                moves_san=_moves_san(rows),
+                game_over=game_over,
+                result=result,
+                termination=termination,
+            )
 
-    try:
-        from_sq = chess.parse_square(req.from_square)
-        to_square = chess.parse_square(req.to_square)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Некорректный формат клетки")
+        human_bool = _human_color_bool(g.human_color)
+        if board.turn != human_bool:
+            raise HTTPException(status_code=400, detail="Сейчас не ход человека")
 
-    # Превращение
-    promotion_piece = None
-    if req.promotion:
-        promo_map = {
-            'q': chess.QUEEN,
-            'r': chess.ROOK,
-            'b': chess.BISHOP,
-            'n': chess.KNIGHT,
-        }
-        promotion_piece = promo_map.get(req.promotion.lower())
-        if promotion_piece is None:
-            raise HTTPException(status_code=400, detail="Некорректная фигура для превращения")
+        # parse move
+        try:
+            from_sq = chess.parse_square(req.from_square)
+            to_sq = chess.parse_square(req.to_square)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Некорректный формат клетки")
 
-    user_move = chess.Move(from_sq, to_square, promotion=promotion_piece)
+        promo = _promotion_piece(req.promotion)
 
-    if user_move not in board.legal_moves:
-        raise HTTPException(status_code=400, detail="Невозможный ход.")
+        move_plain = chess.Move(from_sq, to_sq)
+        move_promo = chess.Move(from_sq, to_sq, promotion=promo) if promo is not None else None
 
-    board.push(user_move)
+        if move_plain in board.legal_moves:
+            user_move = move_plain
+        elif move_promo is not None and move_promo in board.legal_moves:
+            user_move = move_promo
+        else:
+            raise HTTPException(status_code=400, detail="Невозможный ход")
 
-    position_deque.append(board_to_planes(board))
+        # save user move
+        _save_move(db, g, board, user_move)
+        hist.append(board_to_planes(board))
 
-    if board.is_game_over():
+        # если после хода человека игра закончилась
+        if board.is_game_over():
+            game_over, result, termination = _outcome_info(board)
+            g.fen = board.fen()
+            g.status = "finished"
+            g.result = result
+            db.commit()
+
+            rows = (
+                db.query(Move)
+                .filter(Move.game_id == g.id)
+                .order_by(Move.ply)
+                .all()
+            )
+            return MoveResponse(
+                game_id=g.id,
+                board_fen=board.fen(),
+                engine_move=None,
+                moves_san=_moves_san(rows),
+                game_over=game_over,
+                result=result,
+                termination=termination,
+            )
+
+        # ход движка
+        engine_move, _policy = mcts.run(board, position_history=hist)
+        if engine_move is None:
+            raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
+
+        _save_move(db, g, board, engine_move)
+        hist.append(board_to_planes(board))
+
+        game_over, result, termination = _outcome_info(board)
+
+        g.fen = board.fen()
+        if game_over:
+            g.status = "finished"
+            g.result = result
+        else:
+            g.status = "ongoing"
+            g.result = None
+
+        db.commit()
+
+        rows = (
+            db.query(Move)
+            .filter(Move.game_id == g.id)
+            .order_by(Move.ply)
+            .all()
+        )
+
         return MoveResponse(
+            game_id=g.id,
             board_fen=board.fen(),
-            engine_move=None,
-            game_over=True,
-            result=board.result(),
+            engine_move=engine_move.uci(),
+            moves_san=_moves_san(rows),
+            game_over=game_over,
+            result=result,
+            termination=termination,
         )
 
-    engine_move, policy = mcts.run(board)
-    if engine_move is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Движок не смог выбрать ход, MCTS вернул None. Проверь логи сервера"
-        )
-
-    board.push(engine_move)
-    position_deque.append(board_to_planes(board))
-
-    game_over = board.is_game_over()
-    result = board.result() if game_over else None
-
-    return MoveResponse(
-        board_fen=board.fen(),
-        engine_move=engine_move.uci(),
-        game_over=game_over,
-        result=result,
-    )
 
 @app.post("/engine_move", response_model=MoveResponse)
-def engine_move():
-    global board
-    _ensure_game_started()
-    assert board is not None
+def engine_move(req: EngineMoveRequest):
+    with SessionLocal() as db:
+        g = _get_game(db, req.game_id)
+        board, hist, rows = _load_board_and_hist(db, g)
 
-    if board.is_game_over():
+        if board.is_game_over():
+            game_over, result, termination = _outcome_info(board)
+            return MoveResponse(
+                game_id=g.id,
+                board_fen=board.fen(),
+                engine_move=None,
+                moves_san=_moves_san(rows),
+                game_over=game_over,
+                result=result,
+                termination=termination,
+            )
+
+        human_bool = _human_color_bool(g.human_color)
+        if board.turn == human_bool:
+            raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
+
+        mv, _policy = mcts.run(board, position_history=hist)
+        if mv is None:
+            raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
+
+        _save_move(db, g, board, mv)
+        hist.append(board_to_planes(board))
+
+        game_over, result, termination = _outcome_info(board)
+        g.fen = board.fen()
+        if game_over:
+            g.status = "finished"
+            g.result = result
+        db.commit()
+
+        rows = (
+            db.query(Move)
+            .filter(Move.game_id == g.id)
+            .order_by(Move.ply)
+            .all()
+        )
+
         return MoveResponse(
+            game_id=g.id,
             board_fen=board.fen(),
-            engine_move=None,
-            game_over=True,
-            result=board.result(),
+            engine_move=mv.uci(),
+            moves_san=_moves_san(rows),
+            game_over=game_over,
+            result=result,
+            termination=termination,
         )
 
-    engine_move, policy = mcts.run(board)
-    if engine_move is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Движок не смог выбрать ход, MCTS вернул None. Проверь логи сервера"
+
+@app.get("/games/{game_id}")
+def get_game(game_id: str):
+    with SessionLocal() as db:
+        g = _get_game(db, game_id)
+        return {
+            "game_id": g.id,
+            "status": g.status,
+            "human_color": g.human_color,
+            "result": g.result,
+            "fen": g.fen,
+            "created_at": g.created_at.isoformat(),
+        }
+
+
+@app.get("/games/{game_id}/moves")
+def get_moves(game_id: str):
+    with SessionLocal() as db:
+        _ = _get_game(db, game_id)
+        rows = (
+            db.query(Move)
+            .filter(Move.game_id == game_id)
+            .order_by(Move.ply)
+            .all()
         )
-
-    board.push(engine_move)
-    position_deque.append(board_to_planes(board))
-
-    game_over = board.is_game_over()
-    result = board.result() if game_over else None
-
-    return MoveResponse(
-        board_fen=board.fen(),
-        engine_move=engine_move.uci(),
-        game_over=game_over,
-        result=result,
-    )
+        return [{"ply": m.ply, "uci": m.uci, "san": m.san, "ts": m.created_at.isoformat()} for m in rows]
 
 
+# -------- Web UI --------
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """<!DOCTYPE html>
@@ -177,66 +402,24 @@ def index():
 <head>
     <meta charset="UTF-8">
     <title>Шахматы с агентом</title>
-
-    <!-- chessboard.js CSS -->
     <link rel="stylesheet" href="/static/css/chessboard-1.0.0.min.css">
-
     <style>
         body {
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             margin: 20px;
             display: flex;
             flex-direction: column;
-            align-items: center; /* центрируем всё по горизонтали */
-        }
-
-        h1 {
-            margin-bottom: 10px;
-        }
-        .top-bar {
-            display: flex;
-            gap: 10px;
             align-items: center;
         }
-        .layout {
-            display: flex;
-            gap: 20px;
-            align-items: flex-start;
-            margin-top: 20px;
-        }
-        #board {
-            width: 480px;
-        }
-        #status {
-            margin-top: 10px;
-            min-height: 20px;
-        }
-        #fen {
-            margin-top: 10px;
-            background: #f5f5f5;
-            padding: 5px;
-            font-family: monospace;
-        }
-        .moves-panel {
-            min-width: 200px;
-            font-size: 14px;
-        }
-        .moves-panel h3 {
-            margin: 0 0 8px 0;
-        }
-        .moves-panel table {
-            border-collapse: collapse;
-            width: 100%;
-        }
-        .moves-panel th,
-        .moves-panel td {
-            padding: 2px 4px;
-            border-bottom: 1px solid #ddd;
-            text-align: left;
-        }
-        .moves-panel th {
-            font-weight: 600;
-        }
+        .top-bar { display:flex; gap:10px; align-items:center; }
+        .layout { display:flex; gap:20px; align-items:flex-start; margin-top:20px; }
+        #board { width: 480px; }
+        #status { margin-top: 10px; min-height: 20px; }
+        #fen { margin-top: 10px; background:#f5f5f5; padding:5px; font-family: monospace; }
+        .moves-panel { min-width: 240px; font-size: 14px; }
+        .moves-panel table { border-collapse: collapse; width: 100%; }
+        .moves-panel th, .moves-panel td { padding: 2px 4px; border-bottom: 1px solid #ddd; text-align:left; }
+        .moves-panel th { font-weight: 600; }
     </style>
 </head>
 <body>
@@ -244,7 +427,7 @@ def index():
 
     <div class="top-bar">
         <button onclick="newGame()">Новая партия</button>
-        <label style="margin-left: 10px;">
+        <label>
             Цвет:
             <select id="colorSelect">
                 <option value="w">Белыми</option>
@@ -265,18 +448,20 @@ def index():
         </div>
     </div>
 
-    <!-- Локальные библиотеки -->
     <script src="/static/js/jquery-3.7.1.min.js"></script>
     <script src="/static/js/chess.min.js"></script>
     <script src="/static/js/chessboard-1.0.0.min.js"></script>
 
     <script>
-        let board = null;      // объект доски (chessboard.js)
-        let game = null;       // логика игры (chess.js)
-        let isMyTurn = true;   // ход человека?
-        let moves = [];        // список ходов в SAN
-        let gameResult = null; // строка результата: "1-0", "0-1" или "1/2-1/2"
-        let humanColor = "w";  // "w" — играем белыми, "b" — чёрными
+        let boardUI = null;
+        let game = null;
+        let gameId = null;
+
+        let isMyTurn = true;
+        let moves = [];
+        let gameResult = null;
+        let termination = null;
+        let humanColor = "w";
 
         function setStatus(msg, isError) {
             const el = document.getElementById('status');
@@ -286,18 +471,14 @@ def index():
 
         function updateFen() {
             const fenEl = document.getElementById('fen');
-            if (game) {
-                fenEl.textContent = game.fen();
-            } else {
-                fenEl.textContent = "";
-            }
+            fenEl.textContent = game ? game.fen() : "";
         }
 
         function renderMoveList() {
             const container = document.getElementById('moves');
             if (!container) return;
 
-            if (moves.length === 0) {
+            if (!moves || moves.length === 0) {
                 container.innerHTML = "<h3>Ходы</h3><p>Пока ходов нет.</p>";
                 return;
             }
@@ -313,104 +494,67 @@ def index():
             }
 
             html += "</table>";
-
             if (gameResult) {
-                html += "<div style='margin-top:4px;font-weight:600;'>Результат: " + gameResult + "</div>";
+                const extra = termination ? (" (" + termination + ")") : "";
+                html += "<div style='margin-top:6px;font-weight:700;'>Результат: " + gameResult + extra + "</div>";
             }
 
             container.innerHTML = html;
         }
 
-
-        function resetMoveList() {
-            moves = [];
-            gameResult = null;
-            renderMoveList();
-        }
-
-        function addMoveToList(san) {
-            moves.push(san);
-            renderMoveList();
-        }
-
-        function onDragStart(source, piece, position, orientation) {
-            // Нельзя двигать фигуры, если игра не начата
+        function onDragStart(source, piece) {
             if (!game) return false;
-
-            // Игра уже закончена
             if (game.game_over()) return false;
-
-            // Сейчас не наш ход
             if (!isMyTurn) return false;
 
             const isWhitePiece = piece[0] === "w";
             const isBlackPiece = piece[0] === "b";
-
-            // Человек играет этим цветом, другим — нельзя
             if (humanColor === "w" && isBlackPiece) return false;
             if (humanColor === "b" && isWhitePiece) return false;
         }
 
         function onDrop(source, target) {
-            if (!game) return "snapback";
-            if (source === target) return "snapback";
-
-            let moveConfig = {
-                from: source,
-                to: target,
-                promotion: "q"  // по умолчанию превращаем в ферзя
-            };
-
-            // Проверка на promotion (превращение пешки)
-            const piece = game.get(source);
-            if (piece && piece.type === "p") {
-                const fromRank = source[1];
-                const toRank = target[1];
-
-                const isWhitePromotion = (piece.color === "w" && fromRank === "7" && toRank === "8");
-                const isBlackPromotion = (piece.color === "b" && fromRank === "2" && toRank === "1");
-
-                if (isWhitePromotion || isBlackPromotion) {
-                    let p = window.prompt("Превращение (q, r, b, n):", "q");
-                    if (!p) p = "q";
-                    p = p.toLowerCase();
-                    if (!["q", "r", "b", "n"].includes(p)) {
-                        p = "q";
-                    }
-                    moveConfig.promotion = p;
-                }
+          if (!game || !gameId) return "snapback";
+          if (source === target) return "snapback";
+        
+          // базовый ход БЕЗ promotion
+          let moveConfig = { from: source, to: target };
+        
+          // promotion prompt
+          const piece = game.get(source);
+          let promo = null;
+        
+          if (piece && piece.type === "p") {
+            const fromRank = source[1], toRank = target[1];
+            const isWhitePromotion = (piece.color === "w" && fromRank === "7" && toRank === "8");
+            const isBlackPromotion = (piece.color === "b" && fromRank === "2" && toRank === "1");
+            if (isWhitePromotion || isBlackPromotion) {
+              promo = window.prompt("Превращение (q, r, b, n):", "q");
+              if (!promo) promo = "q";
+              promo = promo.toLowerCase();
+              if (!["q","r","b","n"].includes(promo)) promo = "q";
+              moveConfig.promotion = promo; // добавляем ТОЛЬКО здесь
             }
-
-            // Пробуем сделать ход локально (chess.js)
-            const move = game.move(moveConfig);
-
-            // Нелегальный ход — откат
-            if (move === null) {
-                return "snapback";
-            }
-
-            // Локально ход ок — обновляем доску
-            board.position(game.fen());
-            updateFen();
-
-            // Добавляем ход белых в список (SAN)
-            if (move.san) {
-                addMoveToList(move.san);
-            }
-
-            const fenBeforeEngine = game.fen();  // позиция перед ходом движка
-            isMyTurn = false;
-
-            // Отправляем ход на сервер (человек всегда белыми)
-            sendMoveToServer(move.from, move.to, move.promotion, fenBeforeEngine);
+          }
+        
+          // локальная проверка chess.js
+          const mv = game.move(moveConfig);
+          if (mv === null) return "snapback";
+        
+          boardUI.position(game.fen());
+          updateFen();
+        
+          isMyTurn = false;
+          sendMoveToServer(source, target, promo); // promo может быть null
         }
 
-        async function sendMoveToServer(from, to, promotion, fenBeforeEngine) {
+        async function sendMoveToServer(from, to, promotion) {
             try {
                 const res = await fetch("/make_move", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
+                        game_id: gameId,
                         from_square: from,
                         to_square: to,
                         promotion: promotion || null
@@ -420,129 +564,38 @@ def index():
                 const data = await res.json();
 
                 if (!res.ok) {
-                    // Сервер сказал, что ход невозможен/ошибка
                     const msg = data.detail || JSON.stringify(data);
                     setStatus("Ошибка сервера: " + msg, true);
-
-                    // Откатываем последний ход игрока
+                    // откат локального хода
                     game.undo();
-                    board.position(game.fen());
+                    boardUI.position(game.fen());
                     updateFen();
                     isMyTurn = true;
                     return;
                 }
 
-                // Считаем SAN хода движка по позиции до его хода
-                let engineSan = null;
-                if (data.engine_move) {
-                    const uci = data.engine_move; // например "e7e5" или "e7e8q"
-                    const fromSq = uci.slice(0, 2);
-                    const toSq = uci.slice(2, 4);
-                    const promo = uci.length > 4 ? uci[4] : undefined;
-
-                    try {
-                        const tmp = new Chess(fenBeforeEngine);
-                        const engineMoveObj = tmp.move({
-                            from: fromSq,
-                            to: toSq,
-                            promotion: promo
-                        });
-                        if (engineMoveObj && engineMoveObj.san) {
-                            engineSan = engineMoveObj.san;
-                        } else {
-                            engineSan = uci;
-                        }
-                    } catch (e) {
-                        engineSan = uci;
-                    }
-                }
-
-                // Сервер — источник истины, позицию берём из его FEN
+                gameId = data.game_id;
                 game.load(data.board_fen);
-                board.position(game.fen());
+                boardUI.position(game.fen());
                 updateFen();
 
-                // Добавляем ход чёрных в список
-                if (engineSan) {
-                    addMoveToList(engineSan);
-                }
+                moves = data.moves_san || [];
+                gameResult = data.result || null;
+                termination = data.termination || null;
+                renderMoveList();
 
                 if (data.game_over) {
-                    gameResult = data.result;  // "1-0", "0-1" или "1/2-1/2"
-                    renderMoveList();          // перерисуем список с результатом
-                    setStatus("Игра окончена. Результат: " + data.result, false);
+                    setStatus("Игра окончена. Результат: " + data.result + (data.termination ? (" ("+data.termination+")") : ""), false);
                     isMyTurn = false;
                 } else {
-                    setStatus("Ход принят. Движок ответил: " + (data.engine_move || "?"), false);
                     isMyTurn = true;
+                    setStatus("Ход принят. Движок ответил: " + (data.engine_move || "?"), false);
                 }
             } catch (err) {
                 setStatus("Ошибка при запросе к серверу: " + err.message, true);
-                // Откат хода на всякий случай
                 game.undo();
-                board.position(game.fen());
+                boardUI.position(game.fen());
                 updateFen();
-                isMyTurn = true;
-            }
-        }
-                async function requestEngineMove(fenBeforeEngine) {
-            try {
-                const res = await fetch("/engine_move", { method: "POST" });
-                const data = await res.json();
-
-                if (!res.ok) {
-                    const msg = data.detail || JSON.stringify(data);
-                    setStatus("Ошибка сервера при ходе движка: " + msg, true);
-                    isMyTurn = true;
-                    return;
-                }
-
-                let engineSan = null;
-                if (data.engine_move) {
-                    const uci = data.engine_move;
-                    const fromSq = uci.slice(0, 2);
-                    const toSq = uci.slice(2, 4);
-                    const promo = uci.length > 4 ? uci[4] : undefined;
-
-                    try {
-                        const tmp = new Chess(fenBeforeEngine);
-                        const engineMoveObj = tmp.move({
-                            from: fromSq,
-                            to: toSq,
-                            promotion: promo
-                        });
-                        if (engineMoveObj && engineMoveObj.san) {
-                            engineSan = engineMoveObj.san;
-                        } else {
-                            engineSan = uci;
-                        }
-                    } catch (e) {
-                        engineSan = uci;
-                    }
-                }
-
-                game.load(data.board_fen);
-                board.position(game.fen());
-                updateFen();
-
-                if (engineSan) {
-                    addMoveToList(engineSan);
-                }
-
-                if (data.game_over) {
-                    gameResult = data.result;
-                    renderMoveList();
-                    setStatus("Игра окончена. Результат: " + data.result, false);
-                    isMyTurn = false;
-                } else {
-                    isMyTurn = true;
-                    setStatus(
-                        "Ход движка выполнен: " + (data.engine_move || "?") + ". Теперь твой ход.",
-                        false
-                    );
-                }
-            } catch (err) {
-                setStatus("Ошибка при ходе движка: " + err.message, true);
                 isMyTurn = true;
             }
         }
@@ -550,53 +603,52 @@ def index():
         async function newGame() {
             setStatus("", false);
             try {
-                const res = await fetch("/new_game", { method: "POST" });
-                const data = await res.json();
-                if (!res.ok) {
-                    throw new Error(data.detail || ("HTTP " + res.status));
-                }
+                const select = document.getElementById("colorSelect");
+                humanColor = select ? select.value : "w";
 
-                // Если доска ещё не создана — создаём её здесь
-                if (!board) {
-                    const config = {
+                const res = await fetch("/new_game", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ human_color: humanColor })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+
+                if (!boardUI) {
+                    boardUI = Chessboard("board", {
                         draggable: true,
                         position: "start",
                         orientation: "white",
                         onDragStart: onDragStart,
                         onDrop: onDrop,
                         pieceTheme: "/static/img/chesspieces/wikipedia/{piece}.png"
-                    };
-                    board = Chessboard("board", config);
+                    });
                 }
 
-                // читаем выбранный цвет
-                const select = document.getElementById("colorSelect");
-                humanColor = select ? select.value : "w";
+                gameId = data.game_id;
+                boardUI.orientation(humanColor === "w" ? "white" : "black");
 
-                // разворачиваем доску в нужную сторону
-                board.orientation(humanColor === "w" ? "white" : "black");
-
-                // Создаём новую игру из стартового FEN, который вернул сервер
                 game = new Chess(data.board_fen);
-                board.position(game.fen());
+                boardUI.position(game.fen());
                 updateFen();
-                resetMoveList();
+
+                moves = data.moves_san || [];
+                gameResult = data.result || null;
+                termination = data.termination || null;
+                renderMoveList();
+
+                // после /new_game, если человек чёрными — движок уже сделал первый ход
+                isMyTurn = true;
 
                 if (humanColor === "w") {
-                    isMyTurn = true;
                     setStatus("Новая партия начата. Ты играешь белыми.", false);
                 } else {
-                    // мы играем чёрными — движок делает первый ход
-                    isMyTurn = false;
-                    setStatus("Новая партия начата. Ты играешь чёрными. Движок делает первый ход...", false);
-                    const fenBeforeEngine = game.fen();
-                    await requestEngineMove(fenBeforeEngine);
+                    setStatus("Новая партия начата. Ты играешь чёрными. Движок уже сделал первый ход.", false);
                 }
             } catch (err) {
                 setStatus("Ошибка при создании новой партии: " + err.message, true);
             }
         }
-
     </script>
 </body>
 </html>"""
