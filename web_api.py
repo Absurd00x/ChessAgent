@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from constants import CHECKPOINT_PATH, LAST_POSITIONS
+from constants import CHECKPOINT_PATH, LAST_POSITIONS, WEB_MCTS_SIMULATIONS
 from db import SessionLocal, Game, Move, create_tables
 from env import board_to_planes
 from nw import CNNActorCritic
@@ -49,7 +49,7 @@ else:
     print(f"[WARN] checkpoint not found: {CHECKPOINT_PATH}. Using random weights.")
     model.eval()
 
-WEB_MCTS_SIMULATIONS = int(os.getenv("WEB_MCTS_SIMULATIONS", "256"))
+
 mcts = MCTS(number_of_simulations=WEB_MCTS_SIMULATIONS, model=model, device=device)
 
 
@@ -175,7 +175,7 @@ def new_game(req: NewGameRequest):
             board_hist = deque(maxlen=LAST_POSITIONS)
             board_hist.append(board_to_planes(board))
 
-            mv, _policy = mcts.run(board, position_history=board_hist)
+            mv, _policy = mcts.run(board, position_history=board_hist, add_dirichlet_noise=False)
             if mv is None:
                 raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
             _save_move(db, g, board, mv)
@@ -276,7 +276,7 @@ def make_move(req: MoveRequest):
             )
 
         # ход движка
-        engine_move, _policy = mcts.run(board, position_history=hist)
+        engine_move, _policy = mcts.run(board, position_history=hist, add_dirichlet_noise=False)
         if engine_move is None:
             raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
 
@@ -335,7 +335,7 @@ def engine_move(req: EngineMoveRequest):
         if board.turn == human_bool:
             raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
 
-        mv, _policy = mcts.run(board, position_history=hist)
+        mv, _policy = mcts.run(board, position_history=hist, add_dirichlet_noise=False)
         if mv is None:
             raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
 

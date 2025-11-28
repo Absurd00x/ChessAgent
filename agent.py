@@ -31,6 +31,20 @@ def policy_to_pi_vector(board: chess.Board, policy:dict) -> np.ndarray:
         pi[action_id] = prob
     return pi
 
+def _material_diff(board: chess.Board) -> int:
+    values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+        chess.KING: 0,
+    }
+    diff = 0
+    for piece in board.piece_map().values():
+        v = values[piece.piece_type]
+        diff += v if piece.color == chess.WHITE else -v
+    return diff
 
 def self_play_game(model: CNNActorCritic,
                    num_simulations=64,
@@ -85,21 +99,30 @@ def self_play_game(model: CNNActorCritic,
         moves_cnt += 1
 
     outcome = board.outcome()
-    if outcome is None or outcome.winner is None:
-        z_white = 0.0
-        winner = None
-    else:
-        if outcome.winner == chess.WHITE:
+    exceeded_max_moves = (moves_cnt == max_moves) and (not board.is_game_over())
+
+    if exceeded_max_moves:
+        # adjudication: если обрубили по лимиту ходов
+        diff = _material_diff(board)
+        TH = 4
+        if diff >= TH:
             z_white = 1.0
-        else:
+        elif diff <= -TH:
             z_white = -1.0
+        else:
+            z_white = 0.0
+    else:
+        # обычная концовка по правилам
+        if outcome is None or outcome.winner is None:
+            z_white = 0.0
+        else:
+            z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
 
     data = []
     for obs, pi_vec, player in trajectory:
         z = z_white if player == chess.WHITE else -z_white
         data.append((obs, pi_vec, z))
 
-    exceeded_max_moves = (moves_cnt == max_moves) and (not board.is_game_over())
     return data, exceeded_max_moves
 
 
@@ -358,9 +381,6 @@ class MCTS:
                 logits, v_pred = self.model(obs_t)
                 v = float(v_pred.item())
                 probs = torch.softmax(logits, dim=-1).cpu().numpy().reshape(-1)
-
-            if board.turn != root_node.player_to_move:
-                v = -v
 
             priors = {}
             total_p = 0.0
