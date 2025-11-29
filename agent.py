@@ -69,7 +69,7 @@ def self_play_game(model: CNNActorCritic,
 
     temperature_moves = 20  # первые 20 полуходов выбираем с температурой
 
-    while not board.is_game_over() and moves_cnt < max_moves:
+    while not board.is_game_over(claim_draw=True) and moves_cnt < max_moves:
         player = board.turn
         obs = board_to_obs(board, position_deque)
 
@@ -98,8 +98,8 @@ def self_play_game(model: CNNActorCritic,
         position_deque.append(board_to_planes(board))
         moves_cnt += 1
 
-    outcome = board.outcome()
-    exceeded_max_moves = (moves_cnt == max_moves) and (not board.is_game_over())
+    outcome = board.outcome(claim_draw=True)
+    exceeded_max_moves = (moves_cnt == max_moves) and (not board.is_game_over(claim_draw=True))
 
     if exceeded_max_moves:
         # adjudication: если обрубили по лимиту ходов
@@ -149,7 +149,8 @@ def train_one_iteration(model: CNNActorCritic,
         return None
 
     # 2. добавляем позиции партии в буфер
-    replay_buffer.add_many(data)
+    if not exceeded_move_limit:
+        replay_buffer.add_many(data)
     buffer_size = len(replay_buffer)
 
     # Если данных совсем мало — просто копим буфер, почти не обучаясь
@@ -453,7 +454,7 @@ class MCTS:
         """
         b = board.copy()
         depth = 0
-        while not b.is_game_over() and depth < max_depth:
+        while not b.is_game_over(claim_draw=True) and depth < max_depth:
             moves = self._get_legal_moves(b)
             if not moves:
                 break
@@ -461,10 +462,10 @@ class MCTS:
             b.push(move)
             depth += 1
 
-        if not b.is_game_over():
+        if not b.is_game_over(claim_draw=True):
             return 0.0
 
-        outcome = b.outcome()
+        outcome = b.outcome(claim_draw=True)
         if outcome is None or outcome.winner is None:
             return 0.0
 
@@ -476,10 +477,10 @@ class MCTS:
         return list(board.legal_moves)
 
     def _is_terminal(self, board: chess.Board) -> bool:
-        return board.is_game_over()
+        return board.is_game_over(claim_draw=True)
 
     def _evaluate_terminal(self, board: chess.Board, player_to_move: bool) -> float:
-        outcome = board.outcome()
+        outcome = board.outcome(claim_draw=True)
         if outcome is None or outcome.winner is None:
             return 0.0
 
@@ -501,7 +502,7 @@ class MCTS:
         Оценка нетерминальной позиции по материалу с точки зрения root_player
         Возвращает диапазон примерно [-1, 1].
         """
-        assert not board.is_game_over()
+        assert not board.is_game_over(claim_draw=True)
 
         white_mat = self._material(board, chess.WHITE)
         black_mat = self._material(board, chess.BLACK)

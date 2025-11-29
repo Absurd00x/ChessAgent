@@ -91,12 +91,13 @@ def _promotion_piece(p: str | None):
 
 
 def _outcome_info(board: chess.Board):
-    if not board.is_game_over():
+    if not board.is_game_over(claim_draw=True):
         return False, None, None
-    outcome = board.outcome()
-    result = board.result()
+    outcome = board.outcome(claim_draw=True)
+    result = board.result(claim_draw=True)
     termination = outcome.termination.name if outcome is not None else None
     return True, result, termination
+
 
 
 def _load_board_and_hist(db, game: Game):
@@ -212,7 +213,7 @@ def make_move(req: MoveRequest):
         g = _get_game(db, req.game_id)
 
         board, hist, rows = _load_board_and_hist(db, g)
-        if board.is_game_over():
+        if board.is_game_over(claim_draw=True):
             game_over, result, termination = _outcome_info(board)
             return MoveResponse(
                 game_id=g.id,
@@ -252,7 +253,7 @@ def make_move(req: MoveRequest):
         hist.append(board_to_planes(board))
 
         # если после хода человека игра закончилась
-        if board.is_game_over():
+        if board.is_game_over(claim_draw=True):
             game_over, result, termination = _outcome_info(board)
             g.fen = board.fen()
             g.status = "finished"
@@ -319,7 +320,7 @@ def engine_move(req: EngineMoveRequest):
         g = _get_game(db, req.game_id)
         board, hist, rows = _load_board_and_hist(db, g)
 
-        if board.is_game_over():
+        if board.is_game_over(claim_draw=True):
             game_over, result, termination = _outcome_info(board)
             return MoveResponse(
                 game_id=g.id,

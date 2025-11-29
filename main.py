@@ -16,7 +16,7 @@ def play_game_mcts_vs_random(num_simulations=256, max_moves=200):
     mcts = MCTS(number_of_simulations=num_simulations)
 
     move_number = 1
-    while not board.is_game_over() and move_number <= max_moves:
+    while not board.is_game_over(claim_draw=True) and move_number <= max_moves:
         print(f"\nMove {move_number}")
         print(board)
 
@@ -33,7 +33,7 @@ def play_game_mcts_vs_random(num_simulations=256, max_moves=200):
 
     print("\nFinal position:")
     print(board)
-    print("Game over:", board.outcome())
+    print("Game over:", board.outcome(claim_draw=True))
 
 def play_game_mcts_nn_vs_random(num_simulations=256, max_moves=200, device="cpu"):
     board = chess.Board()
@@ -48,7 +48,7 @@ def play_game_mcts_nn_vs_random(num_simulations=256, max_moves=200, device="cpu"
                 device=device)
 
     move_number = 1
-    while not board.is_game_over() and move_number <= max_moves:
+    while not board.is_game_over(claim_draw=True) and move_number <= max_moves:
         print(f"Move {move_number}")
         print(board)
 
@@ -64,7 +64,7 @@ def play_game_mcts_nn_vs_random(num_simulations=256, max_moves=200, device="cpu"
 
     print("\nFinal position:")
     print(board)
-    print("Game over:", board.outcome())
+    print("Game over:", board.outcome(claim_draw=True))
 
 
 def debug_once():
