@@ -28,7 +28,7 @@ TRAINING_MAX_MOVES=100_000
 REPLAY_CAPACITY = 300_000       # максимум позиций в буфере
 MIN_REPLAY_SIZE = 30_000        # с какого размера буфера начинаем full-обучение
 BATCH_SIZE = 256               # размер минибатча
-TRAIN_STEPS_PER_ITER = 96      # сколько SGD-шагов на одну итерацию
+TRAIN_STEPS_PER_ITER = 16      # сколько SGD-шагов на одну итерацию
 DEFAULT_REPLAY_PATH = "replay_buffer/replay_buffer.npz"
 # ===========================================================
 
