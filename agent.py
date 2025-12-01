@@ -2,7 +2,7 @@ import math
 import random
 import numpy as np
 from env import board_to_planes, board_to_obs, action_id_to_move, move_to_id
-import chess
+import chess, chess.polyglot
 import torch
 import torch.nn.functional as F
 from nw import CNNActorCritic
@@ -14,6 +14,7 @@ from constants import (
     BATCH_SIZE,
     MIN_REPLAY_SIZE,
     TRAIN_STEPS_PER_ITER,
+    INFERENCE_BATCH_SIZE,
 )
 from replay_buffer import replay_buffer
 
@@ -59,7 +60,8 @@ def self_play_game(model: CNNActorCritic,
     """
     mcts = MCTS(number_of_simulations=num_simulations,
                 model=model,
-                device=device)
+                device=device,
+                inference_batch_size=INFERENCE_BATCH_SIZE)
     board = chess.Board()
     position_deque.clear()
     position_deque.append(board_to_planes(board))
@@ -74,7 +76,7 @@ def self_play_game(model: CNNActorCritic,
         obs = board_to_obs(board, position_deque)
 
         # MCTS c шумом Дирихле в корне
-        move, policy = mcts.run(board, add_dirichlet_noise=True)
+        move, policy = mcts.run(board, add_dirichlet_noise=True, reuse_tree=True)
 
         # π всегда берём как нормализованные visit counts
         pi_vec = policy_to_pi_vector(board, policy)
@@ -99,31 +101,18 @@ def self_play_game(model: CNNActorCritic,
         moves_cnt += 1
 
     outcome = board.outcome(claim_draw=True)
-    exceeded_max_moves = (moves_cnt == max_moves) and (not board.is_game_over(claim_draw=True))
 
-    if exceeded_max_moves:
-        # adjudication: если обрубили по лимиту ходов
-        diff = _material_diff(board)
-        TH = 4
-        if diff >= TH:
-            z_white = 1.0
-        elif diff <= -TH:
-            z_white = -1.0
-        else:
-            z_white = 0.0
+    if outcome is None or outcome.winner is None:
+        z_white = 0.0
     else:
-        # обычная концовка по правилам
-        if outcome is None or outcome.winner is None:
-            z_white = 0.0
-        else:
-            z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
+        z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
 
     data = []
     for obs, pi_vec, player in trajectory:
         z = z_white if player == chess.WHITE else -z_white
         data.append((obs, pi_vec, z))
 
-    return data, exceeded_max_moves
+    return data, outcome
 
 
 def train_one_iteration(model: CNNActorCritic,
@@ -141,16 +130,15 @@ def train_one_iteration(model: CNNActorCritic,
     """
 
     # 1. self-play: одна партия
-    data, exceeded_move_limit = self_play_game(model=model,
-                                               num_simulations=num_simulations,
-                                               max_moves=max_moves,
-                                               device=device)
+    data, outcome = self_play_game(model=model,
+                                   num_simulations=num_simulations,
+                                   max_moves=max_moves,
+                                   device=device)
     if data is None or len(data) == 0:
         return None
 
     # 2. добавляем позиции партии в буфер
-    if not exceeded_move_limit:
-        replay_buffer.add_many(data)
+    replay_buffer.add_many(data)
     buffer_size = len(replay_buffer)
 
     # Если данных совсем мало — просто копим буфер, почти не обучаясь
@@ -163,7 +151,7 @@ def train_one_iteration(model: CNNActorCritic,
             "buffer_size": buffer_size,
             "train_steps": 0,
             "positions_used_for_training": 0,
-            "exceeded_move_limit": exceeded_move_limit
+            "outcome": outcome
         }
 
     # Сколько шагов SGD делаем на этой итерации
@@ -211,325 +199,284 @@ def train_one_iteration(model: CNNActorCritic,
         "buffer_size": buffer_size,                 # размер буфера после добавления
         "train_steps": train_steps,                 # сколько SGD-шагов
         "positions_used_for_training": total_positions_used,
-        "exceeded_move_limit": exceeded_move_limit,
+        "outcome": outcome,
     }
 
-
-
 class Node:
-    def __init__(self, prior: float, player_to_move: bool):
-        # Вероятность, что меня, а не другого ребёнка выберет родитель
-        self.prior_probability = float(prior)
-        # Сколько раз меня выбирали за всё время
-        self.number_of_visits = 0
-        # Оценка моего состояния
-        self.value = 0.0
-        # value / number_of_visits
-        self.mean_value = 0.0
-        self.children = {}
-        # 1 = white, 0 = black
+    def __init__(self, player_to_move: bool):
         self.player_to_move = player_to_move
+        self.number_of_visits = 0
+        self.value_sum = 0.0
+        self.mean_value = 0.0
+        # children: move -> (child_hash, prior_on_edge)
+        self.children: dict[chess.Move, tuple[int, float]] = {}
 
 
 class MCTS:
-    def __init__(self,
-                 number_of_simulations: int = 100,
-                 c_puct: float = 1.5,
-                 model: CNNActorCritic | None = None,
-                 device: str = "cpu"):
-        self.number_of_simulations = number_of_simulations
-        # constant predictor upper confidence bound applied to trees
-        # коэффициент исследования в формуле PUCT
-        # Т.е. насколько сильно мы хотим исследовать
-        # Чем больше константа, тем больше исследуем
-        self.c_puct = c_puct
-
+    def __init__(
+        self,
+        number_of_simulations: int = 100,
+        c_puct: float = 1.5,
+        model: CNNActorCritic | None = None,
+        device: str = "cpu",
+        inference_batch_size: int = 64,   # <<< главное: размер батча для NN
+    ):
+        self.number_of_simulations = int(number_of_simulations)
+        self.c_puct = float(c_puct)
         self.model = model
         self.device = device
+        self.inference_batch_size = int(inference_batch_size)
+
         if self.model is not None:
             self.model.to(self.device)
             self.model.eval()
 
-    def _ucb_score(self, parent: Node, child: Node):
-        # Если ещё никогда не были в вершине, то и оценки
-        # у этой вершины нет
+        self.ttable: dict[int, Node] = {}
+
+    def reset_tree(self):
+        self.ttable.clear()
+        self._root_hash = None
+
+    def reroot(self, board: chess.Board):
+        """Сделать текущую позицию новым root, НЕ очищая таблицу."""
+        h = self._board_hash(board)
+        self._root_hash = h
+        self._get_or_create_node(h, player_to_move=board.turn)
+
+    def _board_hash(self, board: chess.Board) -> int:
+        return int(chess.polyglot.zobrist_hash(board))
+
+    def _get_or_create_node(self, state_hash: int, player_to_move: bool) -> Node:
+        node = self.ttable.get(state_hash)
+        if node is None:
+            node = Node(player_to_move=player_to_move)
+            self.ttable[state_hash] = node
+        return node
+
+    def _ucb_score(self, parent: Node, child: Node, prior_edge: float) -> float:
         if child.number_of_visits == 0:
             q = 0.0
         else:
             q = -child.mean_value
 
-        _eps = 1e-8
-        u = (self.c_puct
-             * child.prior_probability
-             * math.sqrt(parent.number_of_visits + _eps)
-             / (1.0 + child.number_of_visits))
+        eps = 1e-8
+        u = (
+            self.c_puct
+            * float(prior_edge)
+            * math.sqrt(parent.number_of_visits + eps)
+            / (1.0 + child.number_of_visits)
+        )
         return q + u
 
-    def run(self, root_state, position_history=None, add_dirichlet_noise: bool = False):
-        """
-        Главный метод:
-        - root_state — chess.Board
-        - Вернёт лучшую action и распределение policy по действиям.
-        - Если add_dirichlet_noise=True, то в корне добавляем шум Дирихле
-          к приорам (используется только в self-play).
-        """
-        root = Node(prior=1.0, player_to_move=self._player_to_move(root_state))
+    def _make_root_prior_override(self, root: Node, alpha: float = 0.3, epsilon: float = 0.25):
+        # children: move -> (child_hash, prior)
+        moves = list(root.children.keys())
+        if not moves:
+            return None
 
-        dirichlet_applied = False
+        priors = np.array([root.children[mv][1] for mv in moves], dtype=np.float64)
+        priors_sum = priors.sum()
+        if priors_sum > 0:
+            priors /= priors_sum
+        else:
+            priors[:] = 1.0 / len(moves)
+
+        noise = np.random.dirichlet([alpha] * len(moves))
+        mixed = (1.0 - epsilon) * priors + epsilon * noise
+
+        return {mv: float(p) for mv, p in zip(moves, mixed)}
+
+    def run(self, root_state: chess.Board,
+            position_history=None,
+            add_dirichlet_noise: bool = False,
+            reuse_tree: bool = False):
+        assert self.model is not None, "MCTS: model is None"
+
+        root_hash = self._board_hash(root_state)
+
+        if (not reuse_tree) or (not self.ttable) or (getattr(self, "_root_hash", None) != root_hash):
+            # либо не переиспользуем, либо дерево пустое, либо другая позиция → стартуем заново
+            self.ttable.clear()
+            self._root_hash = root_hash
+
+        root = self._get_or_create_node(root_hash, player_to_move=root_state.turn)
+        root_prior_override = None
+        if add_dirichlet_noise and root.children:
+            root_prior_override = self._make_root_prior_override(root)
+
+        # ---- батчим только evaluation/expansion ----
+        pending = []  # список задач на оценку нейросетью
 
         for _ in range(self.number_of_simulations):
-            self._simulate(root_state, root, position_history=position_history)
+            res = self._traverse_to_leaf(root_state, root, position_history=position_history, root_prior_override=root_prior_override)
 
-            # Как только у корня появились дети — один раз
-            # добавляем к их prior'ам шум Дирихле
-            if add_dirichlet_noise and (not dirichlet_applied) and root.children:
-                self._add_dirichlet_noise(root)
-                dirichlet_applied = True
+            if res["terminal"]:
+                # терминал: можем сразу backprop
+                value = res["value"]
+                self._backup(res["path"], value)
+                continue
+
+            # нетерминальный лист -> откладываем в батч
+            pending.append(res)
+
+            # если батч набрался — делаем inference пачкой
+            if len(pending) >= self.inference_batch_size:
+                self._eval_expand_backup_batch(pending)
+                # если root был листом и только что расширился, то override создастся сейчас
+                if add_dirichlet_noise and root_prior_override is None and root.children:
+                    root_prior_override = self._make_root_prior_override(root)
+                pending.clear()
+
+        # добиваем хвост
+        if pending:
+            self._eval_expand_backup_batch(pending)
+            # если root был листом и только что расширился, то override создастся сейчас
+            if add_dirichlet_noise and root_prior_override is None and root.children:
+                root_prior_override = self._make_root_prior_override(root)
+
+            pending.clear()
 
         best_action = self._select_action_from_root(root)
         policy = self._policy_from_root(root)
+
+        if reuse_tree and best_action is not None and best_action in root.children:
+            child_h, _p = root.children[best_action]
+            self._root_hash = child_h  # новый root — выбранный ребёнок
+
         return best_action, policy
 
-    def _add_dirichlet_noise(self, root: Node,
-                             alpha: float = 0.3,
-                             epsilon: float = 0.25):
-        """
-        Добавляем шум Дирихле к приорам в корне дерева.
-        Используем только в self-play, чтобы дебюты были разнообразнее.
-
-        root.children[move].prior_probability
-        <- (1 - eps) * prior + eps * noise_i
-        """
-        if not root.children:
-            return
-
-        n = len(root.children)
-        # генерируем вектор шума из Dirichlet(alpha)
-        noise = np.random.dirichlet([alpha] * n)
-
-        for child, n_i in zip(root.children.values(), noise):
-            child.prior_probability = (
-                (1.0 - epsilon) * child.prior_probability
-                + epsilon * float(n_i)
-            )
-
-
-    def _player_to_move(self, state:chess.Board):
-        """
-        True = white, False = black (совпадает с chess.WHITE / chess.BLACK).
-        """
-        return state.turn
-
-    def _simulate(self, state: chess.Board, root_node: Node, position_history=None):
-        """
-        Одна MCTS-симуляция.
-        state: текущее состояние доски
-        root_node: соответствующий узел в дереве
-        - идти вниз по дереву (Selection),
-        - возможно расширять (Expansion),
-        - оценивать (Rollout/Evaluation),
-        - поднимать value вверх (Backup).
-        """
+    def _traverse_to_leaf(self, state: chess.Board, root_node: Node, position_history=None, root_prior_override=None):
         board = state.copy()
 
         base_hist = position_history if position_history is not None else position_deque
         hist = deque(base_hist, maxlen=LAST_POSITIONS)
 
-        path = [root_node]
+        path: list[Node] = [root_node]
         node = root_node
 
-        # Selection
         while True:
-            if self._is_terminal(board):
-                break
+            if board.is_game_over(claim_draw=True):
+                outcome = board.outcome(claim_draw=True)
+                if outcome is None or outcome.winner is None:
+                    value = 0.0
+                else:
+                    value = 1.0 if outcome.winner == root_node.player_to_move else -1.0
+                return {"terminal": True, "value": float(value), "path": path}
+
             if not node.children:
+                # нашли лист (не расширен)
                 break
 
             best_score = float("-inf")
             best_move = None
             best_child = None
 
-            for move, child in node.children.items():
-                score = self._ucb_score(node, child)
-                if score > best_score:
-                    best_score = score
+            for move, (child_hash, prior) in node.children.items():
+                child = self.ttable[child_hash]
+                prior_used = prior
+                if root_prior_override is not None and node is root_node:
+                    prior_used = root_prior_override.get(move, prior)
+                s = self._ucb_score(node, child, prior_used)
+                if s > best_score:
+                    best_score = s
                     best_move = move
                     best_child = child
 
-            assert best_child is not None, "MCTS: best_child is None, дерево в неконсистентном состоянии"
+            assert best_move is not None and best_child is not None
 
             board.push(best_move)
             hist.append(board_to_planes(board))
             node = best_child
             path.append(node)
 
-        # Теперь board / node - лист (или терминальная позиция)
+        # лист не терминальный → готовим obs/легальные ходы
+        obs = board_to_obs(board, hist)  # np.ndarray
+        legal_moves = list(board.legal_moves)
+        return {
+            "terminal": False,
+            "board": board,
+            "obs": obs,
+            "legal_moves": legal_moves,
+            "leaf_node": node,
+            "path": path,
+            "is_root_leaf": (node is root_node),
+        }
 
-        # Expansion + evaluation
+    def _eval_expand_backup_batch(self, batch):
+        # batch: list of dict from _traverse_to_leaf
+        obs_batch = np.stack([x["obs"] for x in batch], axis=0)
+        obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
 
-        if self._is_terminal(board):
-            value = self._evaluate_terminal(board, root_node.player_to_move)
-        else:
-            legal_moves = self._get_legal_moves(board)
-            assert legal_moves, "MCTS: нет легальных ходов в нетерминальной позиции"
-            assert self.model is not None, "MCTS: модель не передали, получил None"
+        with torch.no_grad():
+            logits, v_pred = self.model(obs_t)
+            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            values = v_pred.detach().cpu().numpy().reshape(-1)
 
-            obs = board_to_obs(board, hist)
-            obs_t = torch.as_tensor(obs, dtype=torch.float32,
-                                    device=self.device).unsqueeze(0)
+        # если нужно — применяем дирихле к root priors (только для тех элементов batch, где leaf==root)
+        # на практике root расширяется в первом батче, поэтому это работает.
+        for i, item in enumerate(batch):
+            leaf = item["leaf_node"]
+            board = item["board"]
+            legal_moves = item["legal_moves"]
 
-            with torch.no_grad():
-                logits, v_pred = self.model(obs_t)
-                v = float(v_pred.item())
-                probs = torch.softmax(logits, dim=-1).cpu().numpy().reshape(-1)
-
+            # expand leaf: посчитать priors по probs[i]
             priors = {}
             total_p = 0.0
-
-            for move in legal_moves:
-                action_id = move_to_id(board, move)
-                assert 0 <= action_id < TOTAL_MOVES, "move_to_id вернул некорректный id"
-                p = float(probs[action_id])
-                priors[move] = p
+            for mv in legal_moves:
+                a = move_to_id(board, mv)
+                p = float(probs[i][a])
+                priors[mv] = p
                 total_p += p
-                
+
             if total_p <= 1e-12:
                 p0 = 1.0 / len(legal_moves)
-                for move in legal_moves:
-                    priors[move] = p0
+                for mv in legal_moves:
+                    priors[mv] = p0
             else:
-                for move in legal_moves:
-                    priors[move] /= total_p
+                inv = 1.0 / total_p
+                for mv in legal_moves:
+                    priors[mv] *= inv
 
-            for move in legal_moves:
-                child = Node(prior=priors[move],
-                             player_to_move=(not node.player_to_move))
-                node.children[move] = child
+            # записываем детей как ребра move -> (hash, prior)
+            for mv in legal_moves:
+                board.push(mv)
+                child_h = self._board_hash(board)
+                board.pop()
 
-            value = v
+                self._get_or_create_node(child_h, player_to_move=(not leaf.player_to_move))
+                leaf.children[mv] = (child_h, float(priors[mv]))
 
-        # backup: поднимаемся по пути вверх
+            value = float(values[i])
+            self._backup(item["path"], value)
+
+    def _backup(self, path: list[Node], value: float):
+        v = float(value)
         for node in path:
             node.number_of_visits += 1
-            node.value += value
-            node.mean_value = node.value / node.number_of_visits
-            value = -value
+            node.value_sum += v
+            node.mean_value = node.value_sum / node.number_of_visits
+            v = -v
 
     def _select_action_from_root(self, root: Node):
-        """
-        Выбираем ход с максимальным числом посещений.
-        Пока считаем, что root.children уже заполнены.
-        """
         if not root.children:
-            return None # Если нет детей, то нет ходов
-
+            return None
         best_move = None
         best_visits = -1
-
-        for move, child in root.children.items():
+        for mv, (child_h, _p) in root.children.items():
+            child = self.ttable[child_h]
             if child.number_of_visits > best_visits:
                 best_visits = child.number_of_visits
-                best_move = move
-
+                best_move = mv
         return best_move
 
     def _policy_from_root(self, root: Node):
-        """
-        Строим распределение по ходам из корня:
-        prob(move) пропорционально number of visits(child)
-        """
-
-        visits = {move: child.number_of_visits for move, child in root.children.items()}
-        total = sum(visits.values())
-        if total == 0:
-            n = len(visits)
-            return {move: 1.0 / n for move in visits.keys()}
-
-        return {move: v / total for move, v in visits.items()}
-
-    def _rollout(self, board: chess.Board, player_to_move_at_root: bool, max_depth: int = 100) -> float:
-        """
-        Простой rollout: играем случайными ходами до конца партии или max_depth.
-        Возвращаем результат с точки зрения player_to_move_at_root.
-        """
-        b = board.copy()
-        depth = 0
-        while not b.is_game_over(claim_draw=True) and depth < max_depth:
-            moves = self._get_legal_moves(b)
-            if not moves:
-                break
-            move = random.choice(moves)
-            b.push(move)
-            depth += 1
-
-        if not b.is_game_over(claim_draw=True):
-            return 0.0
-
-        outcome = b.outcome(claim_draw=True)
-        if outcome is None or outcome.winner is None:
-            return 0.0
-
-        winner = outcome.winner
-        return 1.0 if winner == player_to_move_at_root else -1.0
-
-
-    def _get_legal_moves(self, board: chess.Board):
-        return list(board.legal_moves)
-
-    def _is_terminal(self, board: chess.Board) -> bool:
-        return board.is_game_over(claim_draw=True)
-
-    def _evaluate_terminal(self, board: chess.Board, player_to_move: bool) -> float:
-        outcome = board.outcome(claim_draw=True)
-        if outcome is None or outcome.winner is None:
-            return 0.0
-
-        winner = outcome.winner
-        if winner == player_to_move:
-            return 1.0
-        else:
-            return -1.0
-
-    def _material(self, board: chess.Board, color: bool) -> int:
+        visits = {}
         total = 0
-        for piece in board.piece_map().values():
-            if piece.color == color:
-                total += PIECE_VALUES[piece.piece_type]
-        return total
-
-    def _evaluate_position(self, board: chess.Board, root_player: bool) -> float:
-        """
-        Оценка нетерминальной позиции по материалу с точки зрения root_player
-        Возвращает диапазон примерно [-1, 1].
-        """
-        assert not board.is_game_over(claim_draw=True)
-
-        white_mat = self._material(board, chess.WHITE)
-        black_mat = self._material(board, chess.BLACK)
-
-        if root_player == chess.WHITE:
-            diff = white_mat - black_mat
-        else:
-            diff = black_mat - white_mat
-
-        # нормируем
-        return max(-1.0, min(1.0, diff / 20.0))
-
-    def _evaluate_position_nn(self, board: chess.Board, root_player: bool) -> float:
-        """
-        Оцениваем позицию нейросетью.
-        Сеть обучена давать value с точки зрения игрока, который ходит.
-        Здесь мы переводим это к точке зрения root_player.
-        """
-        assert self.model is not None
-
-        obs = board_to_obs(board, position_deque)
-        obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-
-        with torch.no_grad():
-            v_pred = self.model.values_only(obs_t)
-            v = float(v_pred.item())
-
-        if board.turn != root_player:
-            v = -v
-        return v
+        for mv, (child_h, _p) in root.children.items():
+            c = self.ttable[child_h].number_of_visits
+            visits[mv] = c
+            total += c
+        if total == 0:
+            n = len(visits) if visits else 1
+            return {mv: 1.0 / n for mv in visits}
+        return {mv: c / total for mv, c in visits.items()}

@@ -168,9 +168,25 @@ def main(device: str="cuda"):
                 f"steps={stats.get('train_steps', 0)} "
                 f"train_pos_used={stats.get('positions_used_for_training', 0)}\n"
                 f"elapsed={elapsed:.3f} seconds, "
-                f"average per game={total_elapsed/i:.3f} seconds\n"
-                f"exceeded_move_limit={exceeded_move_limit_games*100/i:.3f}%\n"
+                f"average per game={total_elapsed/i:.3f} seconds"
             )
+            outcome = stats.get("outcome")
+            if outcome is None:
+                print("Exceeded move limit")
+            elif outcome.winner is not None:
+                if outcome.winner is chess.WHITE:
+                    print("White won by checkmate")
+                else:
+                    print("Black won by checkmate")
+            elif outcome.termination == chess.Termination.THREEFOLD_REPETITION:
+                print("Threefold repetition")
+            elif outcome.termination == chess.Termination.STALEMATE:
+                print("Stalemate occurred")
+            elif outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL:
+                print("Draw called due to insufficient material")
+            else:
+                print("Something weird happened... Called draw")
+            print()
 
             # периодически сохраняем модель и replay buffer
             if i % 10 == 0:
