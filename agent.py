@@ -104,7 +104,10 @@ def self_play_game(model: CNNActorCritic,
 
     if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
         score = _material_diff(board)
-        z_white = float(score > 0)
+        if score == 0:
+            z_white = 0.0
+        else:
+            z_white = 1.0 if score > 0 else -1.0
         print(f"final score:{score}")
     else:
         if outcome is None or outcome.winner is None:
