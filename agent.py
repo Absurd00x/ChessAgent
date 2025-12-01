@@ -102,10 +102,15 @@ def self_play_game(model: CNNActorCritic,
 
     outcome = board.outcome(claim_draw=True)
 
-    if outcome is None or outcome.winner is None:
-        z_white = 0.0
+    if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
+        score = _material_diff(board)
+        z_white = float(score > 0)
+        print(f"final score:{score}")
     else:
-        z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
+        if outcome is None or outcome.winner is None:
+            z_white = 0.0
+        else:
+            z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
 
     data = []
     for obs, pi_vec, player in trajectory:
