@@ -15,6 +15,7 @@ from constants import (
     MIN_REPLAY_SIZE,
     TRAIN_STEPS_PER_ITER,
     INFERENCE_BATCH_SIZE,
+    TEMPERATURE_MOVES,
 )
 from replay_buffer import replay_buffer
 
@@ -69,7 +70,7 @@ def self_play_game(model: CNNActorCritic,
     trajectory = []
     moves_cnt = 0
 
-    temperature_moves = 20  # первые 20 полуходов выбираем с температурой
+    temperature_moves = TEMPERATURE_MOVES
 
     while not board.is_game_over(claim_draw=True) and moves_cnt < max_moves:
         player = board.turn
@@ -102,18 +103,10 @@ def self_play_game(model: CNNActorCritic,
 
     outcome = board.outcome(claim_draw=True)
 
-    if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
-        score = _material_diff(board)
-        if score == 0:
-            z_white = 0.0
-        else:
-            z_white = 1.0 if score > 0 else -1.0
-        print(f"final score:{score}")
+    if outcome is None or outcome.winner is None:
+        z_white = 0.0
     else:
-        if outcome is None or outcome.winner is None:
-            z_white = 0.0
-        else:
-            z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
+        z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
 
     data = []
     for obs, pi_vec, player in trajectory:

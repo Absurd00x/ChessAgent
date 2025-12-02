@@ -20,17 +20,18 @@ PIECE_VALUES = {
     chess.KING: 0,  # короля обычно не считаем в материале
 }
 
-TRAINING_MCTS_SIMULATIONS=2048
+TRAINING_MCTS_SIMULATIONS=800
 TRAINING_MAX_MOVES=100_000
 INFERENCE_BATCH_SIZE = 256
+TEMPERATURE_MOVES = 64
 
 # ================== Гиперпараметры буфера ==================
 
-REPLAY_CAPACITY = 300_000       # максимум позиций в буфере
+REPLAY_CAPACITY = 700_000       # максимум позиций в буфере
 MIN_REPLAY_SIZE = 30_000        # с какого размера буфера начинаем full-обучение
 BATCH_SIZE = 256               # размер минибатча
 TRAIN_STEPS_PER_ITER = 16      # сколько SGD-шагов на одну итерацию
 DEFAULT_REPLAY_PATH = "replay_buffer/replay_buffer.npz"
 # ===========================================================
 
-WEB_MCTS_SIMULATIONS = 1024
+WEB_MCTS_SIMULATIONS = 800
