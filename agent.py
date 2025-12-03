@@ -16,10 +16,26 @@ from constants import (
     TRAIN_STEPS_PER_ITER,
     INFERENCE_BATCH_SIZE,
     TEMPERATURE_MOVES,
+    TRAINING_MCTS_SIMULATIONS,
+    DIRICHLET_ALPHA,
+    DIRICHLET_EPSILON,
+    CONTEMPT
 )
 from replay_buffer import replay_buffer
 
 position_deque = deque(maxlen=LAST_POSITIONS)
+
+def apply_temperature(probs, tau: float):
+    probs = np.asarray(probs, dtype=np.float64)
+    probs = np.maximum(probs, 1e-12)
+    if tau <= 1e-6:
+        out = np.zeros_like(probs)
+        out[np.argmax(probs)] = 1.0
+        return out
+    out = probs ** (1.0 / tau)
+    out /= out.sum()
+    return out
+
 
 def policy_to_pi_vector(board: chess.Board, policy:dict) -> np.ndarray:
     """
@@ -70,8 +86,6 @@ def self_play_game(model: CNNActorCritic,
     trajectory = []
     moves_cnt = 0
 
-    temperature_moves = TEMPERATURE_MOVES
-
     while not board.is_game_over(claim_draw=True) and moves_cnt < max_moves:
         player = board.turn
         obs = board_to_obs(board, position_deque)
@@ -83,17 +97,12 @@ def self_play_game(model: CNNActorCritic,
         pi_vec = policy_to_pi_vector(board, policy)
 
         # Для первых ходов выбираем действие случайно из policy
-        if moves_cnt < temperature_moves:
+        if moves_cnt < TEMPERATURE_MOVES:
             moves_list = list(policy.keys())
             probs = np.array([policy[m] for m in moves_list], dtype=np.float64)
-            s = probs.sum()
-            if s <= 0:
-                # деградация на всякий случай
-                probs = np.ones(len(moves_list), dtype=np.float64) / len(moves_list)
-            else:
-                probs /= s
-            idx = np.random.choice(len(moves_list), p=probs)
-            move = moves_list[idx]
+            probs = apply_temperature(probs, tau=1.25)  # попробуй 1.0..1.5
+            move = moves_list[np.random.choice(len(moves_list), p=probs)]
+
         # после temperature_moves оставляем move, который вернул MCTS (argmax)
 
         trajectory.append((obs, pi_vec, player))
@@ -104,7 +113,7 @@ def self_play_game(model: CNNActorCritic,
     outcome = board.outcome(claim_draw=True)
 
     if outcome is None or outcome.winner is None:
-        z_white = 0.0
+        z_white = CONTEMPT
     else:
         z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
 
@@ -118,7 +127,7 @@ def self_play_game(model: CNNActorCritic,
 
 def train_one_iteration(model: CNNActorCritic,
                         optimizer: torch.optim.Optimizer,
-                        num_simulations=64,
+                        num_simulations=TRAINING_MCTS_SIMULATIONS,
                         max_moves=200,
                         device="cpu"):
     """
@@ -269,7 +278,7 @@ class MCTS:
         )
         return q + u
 
-    def _make_root_prior_override(self, root: Node, alpha: float = 0.3, epsilon: float = 0.25):
+    def _make_root_prior_override(self, root: Node, alpha: float = DIRICHLET_ALPHA, epsilon: float = DIRICHLET_EPSILON):
         # children: move -> (child_hash, prior)
         moves = list(root.children.keys())
         if not moves:
