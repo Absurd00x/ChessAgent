@@ -23,17 +23,18 @@ PIECE_VALUES = {
 TRAINING_MCTS_SIMULATIONS=800
 TRAINING_MAX_MOVES=100_000
 INFERENCE_BATCH_SIZE = 256
-TEMPERATURE_MOVES = 8
+TEMPERATURE_MOVES = 512
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPSILON = 0.35
-CONTEMPT = -0.5
+CONTEMPT_AGAINST_DRAW = -0.5
+THREEFOLD = False
 
 # ================== Гиперпараметры буфера ==================
 
 REPLAY_CAPACITY = 700_000       # максимум позиций в буфере
 MIN_REPLAY_SIZE = 30_000        # с какого размера буфера начинаем full-обучение
 BATCH_SIZE = 256               # размер минибатча
-TRAIN_STEPS_PER_ITER = 2      # сколько SGD-шагов на одну итерацию
+TRAIN_STEPS_PER_ITER = 16      # сколько SGD-шагов на одну итерацию
 DEFAULT_REPLAY_PATH = "replay_buffer/replay_buffer.npz"
 # ===========================================================
 

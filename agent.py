@@ -19,7 +19,8 @@ from constants import (
     TRAINING_MCTS_SIMULATIONS,
     DIRICHLET_ALPHA,
     DIRICHLET_EPSILON,
-    CONTEMPT
+    CONTEMPT_AGAINST_DRAW,
+    THREEFOLD,
 )
 from replay_buffer import replay_buffer
 
@@ -86,7 +87,7 @@ def self_play_game(model: CNNActorCritic,
     trajectory = []
     moves_cnt = 0
 
-    while not board.is_game_over(claim_draw=True) and moves_cnt < max_moves:
+    while not board.is_game_over(claim_draw=THREEFOLD) and moves_cnt < max_moves:
         player = board.turn
         obs = board_to_obs(board, position_deque)
 
@@ -110,10 +111,10 @@ def self_play_game(model: CNNActorCritic,
         position_deque.append(board_to_planes(board))
         moves_cnt += 1
 
-    outcome = board.outcome(claim_draw=True)
+    outcome = board.outcome(claim_draw=THREEFOLD)
 
     if outcome is None or outcome.winner is None:
-        z_white = CONTEMPT
+        z_white = CONTEMPT_AGAINST_DRAW
     else:
         z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
 
@@ -365,8 +366,8 @@ class MCTS:
         node = root_node
 
         while True:
-            if board.is_game_over(claim_draw=True):
-                outcome = board.outcome(claim_draw=True)
+            if board.is_game_over(claim_draw=THREEFOLD):
+                outcome = board.outcome(claim_draw=THREEFOLD)
                 if outcome is None or outcome.winner is None:
                     value = 0.0
                 else:

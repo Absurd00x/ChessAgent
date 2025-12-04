@@ -83,6 +83,12 @@ def main(device: str="cuda"):
                 print("Stalemate occurred")
             elif outcome.termination == chess.Termination.INSUFFICIENT_MATERIAL:
                 print("Draw called due to insufficient material")
+            elif outcome.termination == chess.Termination.FIFTY_MOVES:
+                print("Draw by 50 moves")
+            elif outcome.termination == chess.Termination.FIVEFOLD_REPETITION:
+                print("Fivefold repetition")
+            elif outcome.termination == chess.Termination.SEVENTYFIVE_MOVES:
+                print("Draw by 75 moves")
             else:
                 print("Something weird happened... Called draw")
             print()
