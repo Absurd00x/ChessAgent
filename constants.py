@@ -23,18 +23,24 @@ PIECE_VALUES = {
 TRAINING_MCTS_SIMULATIONS=800
 TRAINING_MAX_MOVES=100_000
 INFERENCE_BATCH_SIZE = 256
-TEMPERATURE_MOVES = 512
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPSILON = 0.35
 CONTEMPT_AGAINST_DRAW = -0.5
 THREEFOLD = False
+
+# temperature schedule (self-play)
+TEMPERATURE_MOVES = 512
+TEMPERATURE_TAU_START = 2     # tau на самом старте партии
+TEMPERATURE_TAU_END   = 0.1    # минимальный tau перед переходом в greedy
+TEMPERATURE_DECAY_PLY = 512      # за сколько полуходов (ply) опускаем tau до end
+
 
 # ================== Гиперпараметры буфера ==================
 
 REPLAY_CAPACITY = 700_000       # максимум позиций в буфере
 MIN_REPLAY_SIZE = 30_000        # с какого размера буфера начинаем full-обучение
 BATCH_SIZE = 256               # размер минибатча
-TRAIN_STEPS_PER_ITER = 16      # сколько SGD-шагов на одну итерацию
+TRAIN_STEPS_PER_ITER = 32      # сколько SGD-шагов на одну итерацию
 DEFAULT_REPLAY_PATH = "replay_buffer/replay_buffer.npz"
 # ===========================================================
 

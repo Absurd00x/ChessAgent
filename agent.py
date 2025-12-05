@@ -21,10 +21,19 @@ from constants import (
     DIRICHLET_EPSILON,
     CONTEMPT_AGAINST_DRAW,
     THREEFOLD,
+    TEMPERATURE_TAU_START,
+    TEMPERATURE_TAU_END,
+    TEMPERATURE_DECAY_PLY
 )
 from replay_buffer import replay_buffer
 
 position_deque = deque(maxlen=LAST_POSITIONS)
+
+def temperature_tau(ply: int) -> float:
+    # линейный спад: START -> END за DECAY_PLY полуходов
+    t = min(max(ply, 0), TEMPERATURE_DECAY_PLY)
+    tau = TEMPERATURE_TAU_START + (TEMPERATURE_TAU_END - TEMPERATURE_TAU_START) * (t / TEMPERATURE_DECAY_PLY)
+    return float(tau)
 
 def apply_temperature(probs, tau: float):
     probs = np.asarray(probs, dtype=np.float64)
@@ -101,7 +110,10 @@ def self_play_game(model: CNNActorCritic,
         if moves_cnt < TEMPERATURE_MOVES:
             moves_list = list(policy.keys())
             probs = np.array([policy[m] for m in moves_list], dtype=np.float64)
-            probs = apply_temperature(probs, tau=1.25)  # попробуй 1.0..1.5
+
+            tau = temperature_tau(moves_cnt)  # <-- schedule вместо фиксированного 1.25
+            probs = apply_temperature(probs, tau=tau)
+
             move = moves_list[np.random.choice(len(moves_list), p=probs)]
 
         # после temperature_moves оставляем move, который вернул MCTS (argmax)
