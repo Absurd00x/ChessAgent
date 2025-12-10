@@ -21,7 +21,7 @@ PIECE_VALUES = {
 }
 
 TRAINING_MCTS_SIMULATIONS=800
-TRAINING_MAX_MOVES=100_000
+TRAINING_MAX_MOVES=200_000
 INFERENCE_BATCH_SIZE = 256
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPSILON = 0.35
@@ -31,8 +31,8 @@ THREEFOLD = False
 # temperature schedule (self-play)
 TEMPERATURE_MOVES = 512
 TEMPERATURE_TAU_START = 2     # tau на самом старте партии
-TEMPERATURE_TAU_END   = 0.1    # минимальный tau перед переходом в greedy
-TEMPERATURE_DECAY_PLY = 512      # за сколько полуходов (ply) опускаем tau до end
+TEMPERATURE_TAU_END   = 0.5    # минимальный tau перед переходом в greedy
+TEMPERATURE_DECAY_PLY = 20      # за сколько полуходов (ply) опускаем tau до end
 
 
 # ================== Гиперпараметры буфера ==================
