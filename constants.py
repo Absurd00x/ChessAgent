@@ -30,15 +30,15 @@ REPETITION_PENALTY = -1.0
 THREEFOLD = True
 
 # temperature schedule (self-play)
-TEMPERATURE_MOVES = 768
+TEMPERATURE_MOVES = 512
 TEMPERATURE_TAU_START = 2     # tau на самом старте партии
-TEMPERATURE_TAU_END   = 0.1    # минимальный tau перед переходом в greedy
-TEMPERATURE_DECAY_PLY = 512      # за сколько полуходов (ply) опускаем tau до end
+TEMPERATURE_TAU_END   = 0.2    # минимальный tau перед переходом в greedy
+TEMPERATURE_DECAY_PLY = 384      # за сколько полуходов (ply) опускаем tau до end
 
 
 # ================== Гиперпараметры буфера ==================
 
-REPLAY_CAPACITY = 100_000       # максимум позиций в буфере
+REPLAY_CAPACITY = 700_000       # максимум позиций в буфере
 MIN_REPLAY_SIZE = 3_000        # с какого размера буфера начинаем full-обучение
 BATCH_SIZE = 256               # размер минибатча
 TRAIN_STEPS_PER_ITER = 32      # сколько SGD-шагов на одну итерацию
