@@ -23,7 +23,7 @@ from constants import (
     THREEFOLD,
     TEMPERATURE_TAU_START,
     TEMPERATURE_TAU_END,
-    TEMPERATURE_DECAY_PLY
+    TEMPERATURE_DECAY_PLY, REPETITION_PENALTY
 )
 from replay_buffer import replay_buffer
 
@@ -126,7 +126,10 @@ def self_play_game(model: CNNActorCritic,
     outcome = board.outcome(claim_draw=THREEFOLD)
 
     if outcome is None or outcome.winner is None:
-        z_white = CONTEMPT_AGAINST_DRAW
+        if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
+            z_white = REPETITION_PENALTY
+        else:
+            z_white = CONTEMPT_AGAINST_DRAW
     else:
         z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
 
